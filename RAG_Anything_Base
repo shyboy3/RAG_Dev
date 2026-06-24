@@ -149,11 +149,36 @@ def test_ollama(base_url: str) -> str:
 #  RAG-Anything 인스턴스 빌더 (인덱싱/쿼리 공용)
 # ──────────────────────────────────────────────────────────────────────────────
 def build_rag_instance(working_dir: str, cfg: dict):
-    """RAGAnything 인스턴스를 생성해서 반환. import 실패 시 예외 전달."""
+    """RAGAnything 인스턴스를 생성해서 반환. import 실패 시 예외 전달.
+
+    lightrag-hku 최신 API 기준:
+      - ollama_complete_if_cache → ollama_model_complete
+      - ollama_embed / ollama_embedding 혼용 → 둘 다 시도
+    """
     from raganything import RAGAnything, RAGAnythingConfig
-    from lightrag.llm.ollama import ollama_complete_if_cache, ollama_embed
     from lightrag.utils import EmbeddingFunc
-    import base64
+
+    # ── LLM 함수 import: 버전별 함수명 차이 자동 대응 ──────────────
+    try:
+        from lightrag.llm.ollama import ollama_model_complete as _llm_fn
+    except ImportError:
+        try:
+            from lightrag.llm.ollama import ollama_complete_if_cache as _llm_fn
+        except ImportError:
+            raise ImportError(
+                "lightrag.llm.ollama에서 LLM 함수를 찾을 수 없습니다. pip install -U lightrag-hku 로 업데이트하세요."
+            )
+
+    # ── 임베딩 함수 import ─────────────────────────────────────────
+    try:
+        from lightrag.llm.ollama import ollama_embed as _embed_fn
+    except ImportError:
+        try:
+            from lightrag.llm.ollama import ollama_embedding as _embed_fn
+        except ImportError:
+            raise ImportError(
+                "lightrag.llm.ollama에서 임베딩 함수를 찾을 수 없습니다. pip install -U lightrag-hku 로 업데이트하세요."
+            )
 
     base_url = cfg["ollama_base_url"]
     llm_model = cfg["llm_model"]
@@ -172,22 +197,23 @@ def build_rag_instance(working_dir: str, cfg: dict):
         enable_equation_processing=True,
     )
 
-    def llm_func(prompt, system_prompt=None, history_messages=[], **kwargs):
-        return ollama_complete_if_cache(
+    async def llm_func(prompt, system_prompt=None, history_messages=[], **kwargs):
+        return await _llm_fn(
             llm_model, prompt,
             system_prompt=system_prompt,
             history_messages=history_messages,
-            base_url=base_url,
+            host=base_url,
             options={"num_ctx": num_ctx},
             **kwargs,
         )
 
-    def vision_func(prompt, system_prompt=None, history_messages=[],
-                    image_data=None, messages=None, **kwargs):
+    async def vision_func(prompt, system_prompt=None, history_messages=[],
+                          image_data=None, messages=None, **kwargs):
         if messages:
-            return ollama_complete_if_cache(
-                vlm_model, "", system_prompt=None, history_messages=[],
-                messages=messages, base_url=base_url, **kwargs)
+            return await _llm_fn(
+                vlm_model, "",
+                system_prompt=None, history_messages=[],
+                messages=messages, host=base_url, **kwargs)
         elif image_data:
             msg_list = []
             if system_prompt:
@@ -200,16 +226,19 @@ def build_rag_instance(working_dir: str, cfg: dict):
                      "image_url": {"url": f"data:image/jpeg;base64,{image_data}"}},
                 ],
             })
-            return ollama_complete_if_cache(
-                vlm_model, "", system_prompt=None, history_messages=[],
-                messages=msg_list, base_url=base_url, **kwargs)
+            return await _llm_fn(
+                vlm_model, "",
+                system_prompt=None, history_messages=[],
+                messages=msg_list, host=base_url, **kwargs)
         else:
-            return llm_func(prompt, system_prompt, history_messages, **kwargs)
+            return await llm_func(prompt, system_prompt, history_messages, **kwargs)
 
     embed_func = EmbeddingFunc(
         embedding_dim=embed_dim,
         max_token_size=8192,
-        func=lambda texts: ollama_embed(texts, embed_model=embed_model, base_url=base_url),
+        func=lambda texts: _embed_fn(
+            texts, embed_model=embed_model, host=base_url
+        ),
     )
 
     rag = RAGAnything(
