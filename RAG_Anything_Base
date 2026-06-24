@@ -1,3 +1,25 @@
+# test_rag.py
+import asyncio
+from raganything import RAGAnything, RAGAnythingConfig
+from lightrag.llm.ollama import ollama_model_complete, ollama_embed
+from lightrag.utils import EmbeddingFunc
+
+config = RAGAnythingConfig(working_dir="./test_rag", parser="docling")
+
+rag = RAGAnything(
+    config=config,
+    llm_model_func=lambda prompt, system_prompt=None, history_messages=[], **kw:
+        ollama_model_complete(prompt, system_prompt=system_prompt,
+            history_messages=history_messages, host="http://localhost:11434", **kw),
+    embedding_func=EmbeddingFunc(embedding_dim=768, max_token_size=8192,
+        func=lambda texts: ollama_embed(texts, embed_model="nomic-embed-text",
+            host="http://localhost:11434")),
+    lightrag_kwargs={"llm_model_name": "qwen3:8b"},
+)
+print("✅ 초기화 성공:", type(rag))
+
+
+
 """
 RAG Studio (Gradio Edition) - RAG-Anything 기반 멀티모달 RAG 관리 및 Q&A 웹앱
 요구사항: gradio>=6.0, raganything, lightrag-hku, ollama
