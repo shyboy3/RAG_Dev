@@ -764,12 +764,27 @@ def build_app():
 
 
 if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description="RAG Studio")
+    parser.add_argument("--host", default="127.0.0.1",
+                        help="서버 호스트 (기본: 127.0.0.1 / 내부망 공유: 0.0.0.0)")
+    parser.add_argument("--port", type=int, default=7860,
+                        help="서버 포트 (기본: 7860)")
+    parser.add_argument("--share", action="store_true",
+                        help="Gradio 공개 링크 생성 (외부망 필요)")
+    args = parser.parse_args()
+
     ensure_dirs()
     app = build_app()
-    # Gradio 6: theme/css는 Blocks에, 실행 옵션은 launch()에
+
+    print(f"\n✅ RAG Studio 시작")
+    print(f"   브라우저에서 열기 → http://{args.host}:{args.port}")
+    print(f"   종료: Ctrl+C\n")
+
     app.launch(
-        server_name="0.0.0.0",   # 내부망 공유 시 (air-gap 환경 동료 접근)
-        server_port=7860,
+        server_name=args.host,
+        server_port=args.port,
         show_error=True,
-        inbrowser=True,
+        inbrowser=False,   # 사내 보안망에서 자동 브라우저 오픈 비활성화
+        share=args.share,
     )
