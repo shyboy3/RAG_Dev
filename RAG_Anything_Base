@@ -1,67 +1,38 @@
-# test_rag.py
-import asyncio
-from raganything import RAGAnything, RAGAnythingConfig
-from lightrag.llm.ollama import ollama_model_complete, ollama_embed
-from lightrag.utils import EmbeddingFunc
-
-config = RAGAnythingConfig(working_dir="./test_rag", parser="docling")
-
-rag = RAGAnything(
-    config=config,
-    llm_model_func=lambda prompt, system_prompt=None, history_messages=[], **kw:
-        ollama_model_complete(prompt, system_prompt=system_prompt,
-            history_messages=history_messages, host="http://localhost:11434", **kw),
-    embedding_func=EmbeddingFunc(embedding_dim=768, max_token_size=8192,
-        func=lambda texts: ollama_embed(texts, embed_model="nomic-embed-text",
-            host="http://localhost:11434")),
-    lightrag_kwargs={"llm_model_name": "qwen3:8b"},
-)
-print("✅ 초기화 성공:", type(rag))
-import asyncio
-
-async def run():
-    # 실제 PDF 한 개로 인덱싱 테스트 (경로를 본인 PDF로 변경)
-    await rag.process_document_complete(
-        file_path="test.pdf",   # ← 실제 PDF 경로로 변경
-        output_dir="./test_output",
-        parse_method="auto",
-    )
-    print("✅ 인덱싱 성공")
-
-    # Q&A 테스트
-    answer = await rag.aquery("이 문서의 주요 내용은?", mode="hybrid")
-    print("✅ Q&A 성공:", answer[:200])
-
-asyncio.run(run())
 import os
 os.environ["TIKTOKEN_CACHE_DIR"] = r"C:\tiktoken_cache"
-
-import asyncio
-from raganything import RAGAnything, RAGAnythingConfig
+import asyncio, traceback
+from lightrag import LightRAG
 from lightrag.llm.ollama import ollama_model_complete, ollama_embed
 from lightrag.utils import EmbeddingFunc
 
-config = RAGAnythingConfig(working_dir="./test_rag", parser="docling")
-rag = RAGAnything(
-    config=config,
-    llm_model_func=lambda prompt, system_prompt=None, history_messages=[], **kw:
-        ollama_model_complete(prompt, system_prompt=system_prompt,
+rag = LightRAG(
+    working_dir="./test_full",
+    llm_model_func=lambda p, system_prompt=None, history_messages=[], **kw:
+        ollama_model_complete(p, system_prompt=system_prompt,
             history_messages=history_messages, host="http://localhost:11434", **kw),
+    llm_model_name="qwen3:8b",
     embedding_func=EmbeddingFunc(embedding_dim=768, max_token_size=8192,
         func=lambda texts: ollama_embed(texts, embed_model="nomic-embed-text",
             host="http://localhost:11434")),
-    lightrag_kwargs={"llm_model_name": "qwen3:8b"},
 )
 
 async def run():
-    await rag.process_document_complete(
-        file_path="test.pdf",   # ← 실제 PDF 경로
-        output_dir="./test_output", parse_method="auto")
-    print("✅ 인덱싱 성공")
-    answer = await rag.aquery("이 문서의 주요 내용은?", mode="hybrid")
-    print("✅ Q&A 성공:", answer[:200])
+    await rag.initialize_storages()
+    from lightrag.kg.shared_storage import initialize_pipeline_status
+    await initialize_pipeline_status()
 
-asyncio.run(run())
+    # 텍스트 한 줄 삽입 테스트
+    await rag.ainsert("RAG Studio는 Jaeduck이 만든 멀티모달 RAG 도구입니다.")
+    print("✅ 인덱싱 성공")
+
+    # 질의 테스트
+    ans = await rag.aquery("RAG Studio는 누가 만들었나?", mode="hybrid")
+    print("✅ Q&A 성공:", ans[:200])
+
+try:
+    asyncio.run(run())
+except Exception:
+    traceback.print_exc()
 
 
 
