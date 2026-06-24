@@ -198,14 +198,30 @@ def build_rag_instance(working_dir: str, cfg: dict):
     )
 
     async def llm_func(prompt, system_prompt=None, history_messages=[], **kwargs):
-        return await _llm_fn(
-            llm_model, prompt,
-            system_prompt=system_prompt,
-            history_messages=history_messages,
-            host=base_url,
-            options={"num_ctx": num_ctx},
-            **kwargs,
-        )
+        """ConnectionResetError 발생 시 최대 3회 재시도."""
+        import asyncio as _aio
+        last_err = None
+        for attempt in range(3):
+            try:
+                return await _llm_fn(
+                    llm_model, prompt,
+                    system_prompt=system_prompt,
+                    history_messages=history_messages,
+                    host=base_url,
+                    options={"num_ctx": num_ctx},
+                    **kwargs,
+                )
+            except Exception as e:
+                last_err = e
+                err_str = str(e)
+                # ConnectionResetError(10054) 또는 타임아웃이면 재시도
+                if "10054" in err_str or "ConnectionReset" in err_str or "timeout" in err_str.lower():
+                    wait = 5 * (attempt + 1)
+                    print(f"[LLM] 연결 오류 (시도 {attempt+1}/3), {wait}초 후 재시도: {e}")
+                    await _aio.sleep(wait)
+                    continue
+                raise  # 다른 오류는 즉시 raise
+        raise last_err
 
     async def vision_func(prompt, system_prompt=None, history_messages=[],
                           image_data=None, messages=None, **kwargs):
@@ -429,9 +445,35 @@ def run_indexing(rag_name, folder_img, folder_pdf, folder_doc,
     yield "\n".join(log)
 
 
+def normalize_history(history):
+    """history를 현재 Gradio 환경에 맞는 형식으로 정규화."""
+    if not history:
+        return []
+    normalized = []
+    for item in history:
+        if SUPPORTS_MESSAGES:
+            # dict 형식이어야 함
+            if isinstance(item, dict) and "role" in item and "content" in item:
+                normalized.append(item)
+            elif isinstance(item, (list, tuple)) and len(item) == 2:
+                # 튜플이 섞여 들어온 경우 변환
+                normalized.append({"role": "user", "content": str(item[0] or "")})
+                normalized.append({"role": "assistant", "content": str(item[1] or "")})
+        else:
+            # 튜플 형식이어야 함
+            if isinstance(item, (list, tuple)) and len(item) == 2:
+                normalized.append(list(item))
+            elif isinstance(item, dict) and "role" in item:
+                # dict가 섞여 들어온 경우는 쌍으로 묶기 어려우므로 스킵
+                pass
+    return normalized
+
+
 def answer_question(question, rag_name, mode, history, cfg_state):
     """Q&A — gradio 버전에 따라 messages(dict) 또는 tuples 형식으로 반환"""
-    history = history or []
+    # history 형식 정규화 (Gradio가 None / 혼합 형식으로 넘길 때 대응)
+    history = normalize_history(history)
+
     if not question or not question.strip():
         return history, ""
     if not rag_name:
@@ -448,21 +490,32 @@ def answer_question(question, rag_name, mode, history, cfg_state):
     cfg["query_mode"] = mode
 
     try:
+        from lightrag import QueryParam
         rag = build_rag_instance(working_dir, cfg)
 
         async def _q():
-            return await rag.aquery(question, mode=mode)
+            return await rag.aquery(
+                question,
+                param=QueryParam(mode=mode),
+            )
 
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         answer = loop.run_until_complete(_q())
         loop.close()
+
+        # aquery 반환값이 객체인 경우 텍스트 추출
+        if hasattr(answer, "get_response_text"):
+            answer = answer.get_response_text()
+        elif not isinstance(answer, str):
+            answer = str(answer)
+
     except ImportError as e:
         answer = f"❌ 패키지 미설치: {e}"
     except Exception as e:
         answer = f"❌ 오류: {e}"
 
-    history = to_history_append(history, question, str(answer))
+    history = to_history_append(history, question, answer)
     return history, ""
 
 
