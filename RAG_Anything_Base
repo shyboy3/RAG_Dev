@@ -151,18 +151,20 @@ def test_ollama(base_url: str) -> str:
 def build_rag_instance(working_dir: str, cfg: dict):
     """RAGAnything 인스턴스 생성.
 
-    raganything 1.3.x + lightrag-hku 1.5.x 공식 패턴:
+    확인된 실제 API (lightrag-hku 1.5.3 / raganything 1.3.1):
+      - ollama_model_complete(prompt, ..., **kwargs)
+        → model, host, options 모두 kwargs로 전달
+      - ollama_embed 는 EmbeddingFunc 인스턴스
+        → ollama_embed.func(...) 로 내부 함수 호출
       - RAGAnything(config, llm_model_func, vision_model_func, embedding_func)
-      - Ollama URL → llm_model_func 래퍼 내부에서 kwargs로 전달
-      - 임베딩 → EmbeddingFunc(embedding_dim, max_token_size, func=lambda)
     """
     from raganything import RAGAnything, RAGAnythingConfig
     from lightrag.llm.ollama import ollama_model_complete, ollama_embed
     from lightrag.utils import EmbeddingFunc
 
-    base_url = cfg["ollama_base_url"]
-    llm_model  = cfg["llm_model"]
-    vlm_model  = cfg["vlm_model"]
+    base_url    = cfg["ollama_base_url"]
+    llm_model   = cfg["llm_model"]
+    vlm_model   = cfg["vlm_model"]
     embed_model = cfg["embedding_model"]
     embed_dim   = int(cfg["embedding_dim"])
     num_ctx     = int(cfg["num_ctx"])
@@ -182,7 +184,6 @@ def build_rag_instance(working_dir: str, cfg: dict):
                     model=llm_model,
                     host=base_url,
                     options={"num_ctx": num_ctx},
-                    **kwargs,
                 )
             except Exception as e:
                 last_err = e
@@ -196,17 +197,19 @@ def build_rag_instance(working_dir: str, cfg: dict):
                     raise
         raise last_err
 
-    # ── VLM 래퍼 (이미지 처리) ────────────────────────────────────
+    # ── VLM 래퍼 ──────────────────────────────────────────────────
     async def vision_func(prompt, system_prompt=None,
                           history_messages=[], image_data=None,
                           messages=None, **kwargs):
         if messages:
             return await ollama_model_complete(
                 "",
-                system_prompt=None, history_messages=[],
+                system_prompt=None,
+                history_messages=[],
                 messages=messages,
-                model=vlm_model, host=base_url,
-                options={"num_ctx": num_ctx}, **kwargs,
+                model=vlm_model,
+                host=base_url,
+                options={"num_ctx": num_ctx},
             )
         elif image_data:
             msg_list = []
@@ -217,32 +220,36 @@ def build_rag_instance(working_dir: str, cfg: dict):
                 "content": [
                     {"type": "text", "text": prompt},
                     {"type": "image_url",
-                     "image_url": {"url": f"data:image/jpeg;base64,{image_data}"}},
+                     "image_url": {
+                         "url": f"data:image/jpeg;base64,{image_data}"
+                     }},
                 ],
             })
             return await ollama_model_complete(
                 "",
-                system_prompt=None, history_messages=[],
+                system_prompt=None,
+                history_messages=[],
                 messages=msg_list,
-                model=vlm_model, host=base_url,
-                options={"num_ctx": num_ctx}, **kwargs,
+                model=vlm_model,
+                host=base_url,
+                options={"num_ctx": num_ctx},
             )
         else:
-            return await llm_func(prompt, system_prompt,
-                                  history_messages, **kwargs)
+            return await llm_func(prompt, system_prompt, history_messages)
 
     # ── 임베딩 ────────────────────────────────────────────────────
+    # ollama_embed 는 EmbeddingFunc 인스턴스 → .func 으로 내부 함수 접근
     embed_func = EmbeddingFunc(
         embedding_dim=embed_dim,
         max_token_size=8192,
-        func=lambda texts: ollama_embed(
+        func=lambda texts: ollama_embed.func(
             texts,
             embed_model=embed_model,
             host=base_url,
         ),
     )
 
-    # ── RAGAnythingConfig (파싱 설정만) ───────────────────────────
+    # ── RAGAnythingConfig ─────────────────────────────────────────
     config = RAGAnythingConfig(
         working_dir=working_dir,
         parser=parser,
