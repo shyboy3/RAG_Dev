@@ -19,7 +19,41 @@ from pathlib import Path
 from datetime import datetime
 from typing import Optional
 
+import inspect
 import gradio as gr
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  Gradio 버전 호환 감지
+#  일부 환경에서 gradio 버전 표기는 6.x여도 Chatbot이 type 인자를 받지 못함
+#  (gradio_pdf 등 커스텀 컴포넌트 충돌). 런타임에 실제 시그니처로 판별.
+# ──────────────────────────────────────────────────────────────────────────────
+try:
+    _CHATBOT_PARAMS = inspect.signature(gr.Chatbot.__init__).parameters
+    SUPPORTS_MESSAGES = "type" in _CHATBOT_PARAMS
+except Exception:
+    SUPPORTS_MESSAGES = False
+
+
+def make_chatbot(**kwargs):
+    """type 인자 지원 여부에 따라 안전하게 Chatbot 생성."""
+    if SUPPORTS_MESSAGES:
+        return gr.Chatbot(type="messages", **kwargs)
+    # 구버전(tuples 형식): type/일부 인자 미지원
+    kwargs.pop("type", None)
+    return gr.Chatbot(**kwargs)
+
+
+def to_history_append(history, user_msg, assistant_msg):
+    """버전에 맞는 형식으로 (질문, 답변) 한 쌍을 history에 추가."""
+    history = history or []
+    if SUPPORTS_MESSAGES:
+        history.append({"role": "user", "content": user_msg})
+        history.append({"role": "assistant", "content": assistant_msg})
+    else:
+        # 구버전 튜플 형식: [user, assistant]
+        history.append([user_msg, assistant_msg])
+    return history
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 #  설정/저장 경로
@@ -367,28 +401,22 @@ def run_indexing(rag_name, folder_img, folder_pdf, folder_doc,
 
 
 def answer_question(question, rag_name, mode, history, cfg_state):
-    """Q&A — Chatbot messages 형식 반환 (Gradio 6)"""
+    """Q&A — gradio 버전에 따라 messages(dict) 또는 tuples 형식으로 반환"""
     history = history or []
     if not question or not question.strip():
         return history, ""
     if not rag_name:
-        history.append({"role": "user", "content": question})
-        history.append({"role": "assistant",
-                        "content": "⚠ 먼저 사용할 RAG를 선택하세요."})
+        history = to_history_append(history, question, "⚠ 먼저 사용할 RAG를 선택하세요.")
         return history, ""
 
     reg = load_registry()
     if rag_name not in reg:
-        history.append({"role": "user", "content": question})
-        history.append({"role": "assistant",
-                        "content": f"⚠ '{rag_name}' RAG를 찾을 수 없습니다."})
+        history = to_history_append(history, question, f"⚠ '{rag_name}' RAG를 찾을 수 없습니다.")
         return history, ""
 
     working_dir = reg[rag_name]["working_dir"]
     cfg = dict(cfg_state)
     cfg["query_mode"] = mode
-
-    history.append({"role": "user", "content": question})
 
     try:
         rag = build_rag_instance(working_dir, cfg)
@@ -405,7 +433,7 @@ def answer_question(question, rag_name, mode, history, cfg_state):
     except Exception as e:
         answer = f"❌ 오류: {e}"
 
-    history.append({"role": "assistant", "content": str(answer)})
+    history = to_history_append(history, question, str(answer))
     return history, ""
 
 
@@ -617,9 +645,8 @@ def build_app():
                     )
                     qa_refresh = gr.Button("↻ 목록 갱신", scale=1)
 
-                chatbot = gr.Chatbot(
+                chatbot = make_chatbot(
                     label="대화",
-                    type="messages",
                     height=440,
                 )
                 with gr.Row():
