@@ -228,9 +228,20 @@ def build_rag_instance(working_dir: str, cfg: dict):
         ),
     )
 
-    # ── RAGAnything (공식: working_dir 직접 전달) ─────────────────
-    rag = RAGAnything(
+    # ── RAGAnythingConfig (working_dir는 여기에) ──────────────────
+    from raganything import RAGAnythingConfig
+    config = RAGAnythingConfig(
         working_dir=working_dir,
+        parser=cfg.get("parser", "docling"),
+        parse_method="auto",
+        enable_image_processing=True,
+        enable_table_processing=True,
+        enable_equation_processing=True,
+    )
+
+    # ── RAGAnything (실제 시그니처: config + func들) ──────────────
+    rag = RAGAnything(
+        config=config,
         llm_model_func=llm_model_func,
         vision_model_func=vision_model_func,
         embedding_func=embedding_func,
