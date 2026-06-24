@@ -149,16 +149,16 @@ def test_ollama(base_url: str) -> str:
 #  RAG-Anything 인스턴스 빌더 (인덱싱/쿼리 공용)
 # ──────────────────────────────────────────────────────────────────────────────
 def build_rag_instance(working_dir: str, cfg: dict):
-    """RAGAnything 인스턴스 생성.
+    """RAGAnything 인스턴스 생성 — 공식 README 패턴 그대로.
 
-    확인된 실제 API (lightrag-hku 1.5.3 / raganything 1.3.1):
-      - ollama_model_complete(prompt, ..., **kwargs)
-        → model, host, options 모두 kwargs로 전달
-      - ollama_embed 는 EmbeddingFunc 인스턴스
-        → ollama_embed.func(...) 로 내부 함수 호출
-      - RAGAnything(config, llm_model_func, vision_model_func, embedding_func)
+    핵심 (공식 문서 확인):
+      - RAGAnything(working_dir=, llm_model_func=, vision_model_func=, embedding_func=)
+        → config 객체 없이 직접 인자 전달
+      - llm_model_func 는 lambda 래퍼로 감싸고 **kwargs 그대로 전달
+      - ollama_model_complete 는 model 인자를 첫 인자 다음에 받지 않고,
+        kwargs로 받음 → lambda 안에서 직접 호출
     """
-    from raganything import RAGAnything, RAGAnythingConfig
+    from raganything import RAGAnything
     from lightrag.llm.ollama import ollama_model_complete, ollama_embed
     from lightrag.utils import EmbeddingFunc
 
@@ -168,54 +168,34 @@ def build_rag_instance(working_dir: str, cfg: dict):
     embed_model = cfg["embedding_model"]
     embed_dim   = int(cfg["embedding_dim"])
     num_ctx     = int(cfg["num_ctx"])
-    parser      = cfg.get("parser", "docling")
 
-    # ── LLM 래퍼 ──────────────────────────────────────────────────
-    async def llm_func(prompt, system_prompt=None,
-                       history_messages=[], **kwargs):
-        import asyncio as _aio
-        last_err = None
-        for attempt in range(3):
-            try:
-                return await ollama_model_complete(
-                    prompt,
-                    system_prompt=system_prompt,
-                    history_messages=history_messages,
-                    model=llm_model,
-                    host=base_url,
-                    options={"num_ctx": num_ctx},
-                )
-            except Exception as e:
-                last_err = e
-                s = str(e)
-                if any(k in s for k in ["10054", "ConnectionReset",
-                                        "Connection aborted", "timeout"]):
-                    wait = 5 * (attempt + 1)
-                    print(f"[LLM 재시도 {attempt+1}/3] {wait}초 대기: {e}")
-                    await _aio.sleep(wait)
-                else:
-                    raise
-        raise last_err
+    # ── LLM 함수 (공식 lambda 래퍼 패턴) ──────────────────────────
+    def llm_model_func(prompt, system_prompt=None, history_messages=[], **kwargs):
+        return ollama_model_complete(
+            prompt,
+            system_prompt=system_prompt,
+            history_messages=history_messages,
+            host=base_url,
+            **kwargs,
+        )
 
-    # ── VLM 래퍼 ──────────────────────────────────────────────────
-    async def vision_func(prompt, system_prompt=None,
-                          history_messages=[], image_data=None,
-                          messages=None, **kwargs):
+    # ── VLM 함수 (이미지 처리) ────────────────────────────────────
+    def vision_model_func(prompt, system_prompt=None, history_messages=[],
+                          image_data=None, messages=None, **kwargs):
         if messages:
-            return await ollama_model_complete(
+            return ollama_model_complete(
                 "",
                 system_prompt=None,
                 history_messages=[],
                 messages=messages,
-                model=vlm_model,
                 host=base_url,
-                options={"num_ctx": num_ctx},
+                **kwargs,
             )
         elif image_data:
-            msg_list = []
+            msg = []
             if system_prompt:
-                msg_list.append({"role": "system", "content": system_prompt})
-            msg_list.append({
+                msg.append({"role": "system", "content": system_prompt})
+            msg.append({
                 "role": "user",
                 "content": [
                     {"type": "text", "text": prompt},
@@ -225,46 +205,42 @@ def build_rag_instance(working_dir: str, cfg: dict):
                      }},
                 ],
             })
-            return await ollama_model_complete(
+            return ollama_model_complete(
                 "",
                 system_prompt=None,
                 history_messages=[],
-                messages=msg_list,
-                model=vlm_model,
+                messages=msg,
                 host=base_url,
-                options={"num_ctx": num_ctx},
+                **kwargs,
             )
         else:
-            return await llm_func(prompt, system_prompt, history_messages)
+            return llm_model_func(prompt, system_prompt,
+                                  history_messages, **kwargs)
 
-    # ── 임베딩 ────────────────────────────────────────────────────
-    # ollama_embed 는 EmbeddingFunc 인스턴스 → .func 으로 내부 함수 접근
-    embed_func = EmbeddingFunc(
+    # ── 임베딩 함수 ───────────────────────────────────────────────
+    embedding_func = EmbeddingFunc(
         embedding_dim=embed_dim,
         max_token_size=8192,
-        func=lambda texts: ollama_embed.func(
+        func=lambda texts: ollama_embed(
             texts,
             embed_model=embed_model,
             host=base_url,
         ),
     )
 
-    # ── RAGAnythingConfig ─────────────────────────────────────────
-    config = RAGAnythingConfig(
-        working_dir=working_dir,
-        parser=parser,
-        parse_method="auto",
-        enable_image_processing=True,
-        enable_table_processing=True,
-        enable_equation_processing=True,
-    )
-
-    # ── RAGAnything 인스턴스 ──────────────────────────────────────
+    # ── RAGAnything (공식: working_dir 직접 전달) ─────────────────
     rag = RAGAnything(
-        config=config,
-        llm_model_func=llm_func,
-        vision_model_func=vision_func,
-        embedding_func=embed_func,
+        working_dir=working_dir,
+        llm_model_func=llm_model_func,
+        vision_model_func=vision_model_func,
+        embedding_func=embedding_func,
+        lightrag_kwargs={
+            "llm_model_name": llm_model,
+            "llm_model_kwargs": {
+                "host": base_url,
+                "options": {"num_ctx": num_ctx},
+            },
+        },
     )
     return rag
 
@@ -490,21 +466,17 @@ def answer_question(question, rag_name, mode, history, cfg_state):
     cfg["query_mode"] = mode
 
     try:
-        from lightrag import QueryParam
         rag = build_rag_instance(working_dir, cfg)
 
         async def _q():
-            return await rag.aquery(
-                question,
-                param=QueryParam(mode=mode),
-            )
+            # 공식 API: query_with_multimodal (mode는 문자열로 전달)
+            return await rag.query_with_multimodal(question, mode=mode)
 
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         answer = loop.run_until_complete(_q())
         loop.close()
 
-        # aquery 반환값이 객체인 경우 텍스트 추출
         if hasattr(answer, "get_response_text"):
             answer = answer.get_response_text()
         elif not isinstance(answer, str):
