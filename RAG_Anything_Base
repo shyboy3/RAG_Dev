@@ -33,6 +33,35 @@ async def run():
     print("✅ Q&A 성공:", answer[:200])
 
 asyncio.run(run())
+import os
+os.environ["TIKTOKEN_CACHE_DIR"] = r"C:\tiktoken_cache"
+
+import asyncio
+from raganything import RAGAnything, RAGAnythingConfig
+from lightrag.llm.ollama import ollama_model_complete, ollama_embed
+from lightrag.utils import EmbeddingFunc
+
+config = RAGAnythingConfig(working_dir="./test_rag", parser="docling")
+rag = RAGAnything(
+    config=config,
+    llm_model_func=lambda prompt, system_prompt=None, history_messages=[], **kw:
+        ollama_model_complete(prompt, system_prompt=system_prompt,
+            history_messages=history_messages, host="http://localhost:11434", **kw),
+    embedding_func=EmbeddingFunc(embedding_dim=768, max_token_size=8192,
+        func=lambda texts: ollama_embed(texts, embed_model="nomic-embed-text",
+            host="http://localhost:11434")),
+    lightrag_kwargs={"llm_model_name": "qwen3:8b"},
+)
+
+async def run():
+    await rag.process_document_complete(
+        file_path="test.pdf",   # ← 실제 PDF 경로
+        output_dir="./test_output", parse_method="auto")
+    print("✅ 인덱싱 성공")
+    answer = await rag.aquery("이 문서의 주요 내용은?", mode="hybrid")
+    print("✅ Q&A 성공:", answer[:200])
+
+asyncio.run(run())
 
 
 
