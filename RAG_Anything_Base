@@ -17,6 +17,22 @@ rag = RAGAnything(
     lightrag_kwargs={"llm_model_name": "qwen3:8b"},
 )
 print("✅ 초기화 성공:", type(rag))
+import asyncio
+
+async def run():
+    # 실제 PDF 한 개로 인덱싱 테스트 (경로를 본인 PDF로 변경)
+    await rag.process_document_complete(
+        file_path="test.pdf",   # ← 실제 PDF 경로로 변경
+        output_dir="./test_output",
+        parse_method="auto",
+    )
+    print("✅ 인덱싱 성공")
+
+    # Q&A 테스트
+    answer = await rag.aquery("이 문서의 주요 내용은?", mode="hybrid")
+    print("✅ Q&A 성공:", answer[:200])
+
+asyncio.run(run())
 
 
 
