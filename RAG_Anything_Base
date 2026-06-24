@@ -149,87 +149,65 @@ def test_ollama(base_url: str) -> str:
 #  RAG-Anything 인스턴스 빌더 (인덱싱/쿼리 공용)
 # ──────────────────────────────────────────────────────────────────────────────
 def build_rag_instance(working_dir: str, cfg: dict):
-    """RAGAnything 인스턴스를 생성해서 반환. import 실패 시 예외 전달.
+    """RAGAnything 인스턴스 생성.
 
-    lightrag-hku 최신 API 기준:
-      - ollama_complete_if_cache → ollama_model_complete
-      - ollama_embed / ollama_embedding 혼용 → 둘 다 시도
+    raganything 1.3.x + lightrag-hku 1.5.x 공식 패턴:
+      - RAGAnything(config, llm_model_func, vision_model_func, embedding_func)
+      - Ollama URL → llm_model_func 래퍼 내부에서 kwargs로 전달
+      - 임베딩 → EmbeddingFunc(embedding_dim, max_token_size, func=lambda)
     """
     from raganything import RAGAnything, RAGAnythingConfig
+    from lightrag.llm.ollama import ollama_model_complete, ollama_embed
     from lightrag.utils import EmbeddingFunc
 
-    # ── LLM 함수 import: 버전별 함수명 차이 자동 대응 ──────────────
-    try:
-        from lightrag.llm.ollama import ollama_model_complete as _llm_fn
-    except ImportError:
-        try:
-            from lightrag.llm.ollama import ollama_complete_if_cache as _llm_fn
-        except ImportError:
-            raise ImportError(
-                "lightrag.llm.ollama에서 LLM 함수를 찾을 수 없습니다. pip install -U lightrag-hku 로 업데이트하세요."
-            )
-
-    # ── 임베딩 함수 import ─────────────────────────────────────────
-    try:
-        from lightrag.llm.ollama import ollama_embed as _embed_fn
-    except ImportError:
-        try:
-            from lightrag.llm.ollama import ollama_embedding as _embed_fn
-        except ImportError:
-            raise ImportError(
-                "lightrag.llm.ollama에서 임베딩 함수를 찾을 수 없습니다. pip install -U lightrag-hku 로 업데이트하세요."
-            )
-
     base_url = cfg["ollama_base_url"]
-    llm_model = cfg["llm_model"]
-    vlm_model = cfg["vlm_model"]
+    llm_model  = cfg["llm_model"]
+    vlm_model  = cfg["vlm_model"]
     embed_model = cfg["embedding_model"]
-    embed_dim = int(cfg["embedding_dim"])
-    num_ctx = int(cfg["num_ctx"])
-    parser = cfg.get("parser", "docling")
+    embed_dim   = int(cfg["embedding_dim"])
+    num_ctx     = int(cfg["num_ctx"])
+    parser      = cfg.get("parser", "docling")
 
-    config = RAGAnythingConfig(
-        working_dir=working_dir,
-        parser=parser,
-        parse_method="auto",
-        enable_image_processing=True,
-        enable_table_processing=True,
-        enable_equation_processing=True,
-    )
-
-    async def llm_func(prompt, system_prompt=None, history_messages=[], **kwargs):
-        """ConnectionResetError 발생 시 최대 3회 재시도."""
+    # ── LLM 래퍼 ──────────────────────────────────────────────────
+    async def llm_func(prompt, system_prompt=None,
+                       history_messages=[], **kwargs):
         import asyncio as _aio
         last_err = None
         for attempt in range(3):
             try:
-                return await _llm_fn(
-                    llm_model, prompt,
+                return await ollama_model_complete(
+                    prompt,
                     system_prompt=system_prompt,
                     history_messages=history_messages,
+                    model=llm_model,
                     host=base_url,
                     options={"num_ctx": num_ctx},
                     **kwargs,
                 )
             except Exception as e:
                 last_err = e
-                err_str = str(e)
-                # ConnectionResetError(10054) 또는 타임아웃이면 재시도
-                if "10054" in err_str or "ConnectionReset" in err_str or "timeout" in err_str.lower():
+                s = str(e)
+                if any(k in s for k in ["10054", "ConnectionReset",
+                                        "Connection aborted", "timeout"]):
                     wait = 5 * (attempt + 1)
-                    print(f"[LLM] 연결 오류 (시도 {attempt+1}/3), {wait}초 후 재시도: {e}")
+                    print(f"[LLM 재시도 {attempt+1}/3] {wait}초 대기: {e}")
                     await _aio.sleep(wait)
-                    continue
-                raise  # 다른 오류는 즉시 raise
+                else:
+                    raise
         raise last_err
 
-    async def vision_func(prompt, system_prompt=None, history_messages=[],
-                          image_data=None, messages=None, **kwargs):
+    # ── VLM 래퍼 (이미지 처리) ────────────────────────────────────
+    async def vision_func(prompt, system_prompt=None,
+                          history_messages=[], image_data=None,
+                          messages=None, **kwargs):
         if messages:
-            return await _llm_fn(
-                vlm_model, "",
+            return await ollama_model_complete(
+                "",
                 system_prompt=None, history_messages=[],
-                messages=messages, host=base_url, **kwargs)
+                messages=messages,
+                model=vlm_model, host=base_url,
+                options={"num_ctx": num_ctx}, **kwargs,
+            )
         elif image_data:
             msg_list = []
             if system_prompt:
@@ -242,21 +220,39 @@ def build_rag_instance(working_dir: str, cfg: dict):
                      "image_url": {"url": f"data:image/jpeg;base64,{image_data}"}},
                 ],
             })
-            return await _llm_fn(
-                vlm_model, "",
+            return await ollama_model_complete(
+                "",
                 system_prompt=None, history_messages=[],
-                messages=msg_list, host=base_url, **kwargs)
+                messages=msg_list,
+                model=vlm_model, host=base_url,
+                options={"num_ctx": num_ctx}, **kwargs,
+            )
         else:
-            return await llm_func(prompt, system_prompt, history_messages, **kwargs)
+            return await llm_func(prompt, system_prompt,
+                                  history_messages, **kwargs)
 
+    # ── 임베딩 ────────────────────────────────────────────────────
     embed_func = EmbeddingFunc(
         embedding_dim=embed_dim,
         max_token_size=8192,
-        func=lambda texts: _embed_fn(
-            texts, embed_model=embed_model, host=base_url
+        func=lambda texts: ollama_embed(
+            texts,
+            embed_model=embed_model,
+            host=base_url,
         ),
     )
 
+    # ── RAGAnythingConfig (파싱 설정만) ───────────────────────────
+    config = RAGAnythingConfig(
+        working_dir=working_dir,
+        parser=parser,
+        parse_method="auto",
+        enable_image_processing=True,
+        enable_table_processing=True,
+        enable_equation_processing=True,
+    )
+
+    # ── RAGAnything 인스턴스 ──────────────────────────────────────
     rag = RAGAnything(
         config=config,
         llm_model_func=llm_func,
@@ -266,9 +262,6 @@ def build_rag_instance(working_dir: str, cfg: dict):
     return rag
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-#  폴더 스캔
-# ──────────────────────────────────────────────────────────────────────────────
 def scan_folder(folder: str, ftype: str) -> list:
     if not folder or not Path(folder).is_dir():
         return []
