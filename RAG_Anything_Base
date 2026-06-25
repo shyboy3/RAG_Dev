@@ -69,20 +69,22 @@ else:
     print("[huggingface] docling PDF 파싱이 실패하면, 인터넷 PC의 ~/.cache/huggingface 를 복사하세요.")
 
 # ──────────────────────────────────────────────────────────────────────────────
-#  ★ docling GPU 가속 ★
-#  docling 파싱(레이아웃/표 인식)을 GPU로 돌려 속도를 높인다.
-#  PyTorch가 CUDA 빌드여야 효과가 있다 (torch.cuda.is_available() == True).
-#  CUDA가 없으면 docling이 자동으로 CPU로 폴백하므로 켜둬도 안전하다.
+#  ★ docling 가속 디바이스 자동 설정 ★
+#  CUDA(GPU)가 있으면 GPU로, 없으면 CPU로 자동 설정한다.
+#  강제로 cuda를 지정하면 GPU 없는 환경에서 "CUDA is not available" 경고가
+#  반복 출력되므로, 실제 가용 여부를 먼저 확인해서 맞춘다.
 # ──────────────────────────────────────────────────────────────────────────────
-os.environ.setdefault("DOCLING_DEVICE", "cuda")
 try:
     import torch as _torch
     if _torch.cuda.is_available():
-        print(f"[docling] GPU 가속 ON — CUDA 사용 가능 ({_torch.cuda.get_device_name(0)})")
+        os.environ.setdefault("DOCLING_DEVICE", "cuda")
+        print(f"[docling] GPU 가속 ON — CUDA 사용 ({_torch.cuda.get_device_name(0)})")
     else:
-        print("[docling] ⚠ CUDA 사용 불가 → CPU로 동작 (PyTorch가 CPU 빌드일 수 있음)")
+        os.environ.setdefault("DOCLING_DEVICE", "cpu")
+        print("[docling] CPU 모드로 동작 (GPU 가속을 원하면 PyTorch CUDA 빌드 설치)")
 except Exception:
-    pass
+    os.environ.setdefault("DOCLING_DEVICE", "cpu")
+    print("[docling] CPU 모드로 동작")
 
 import re
 import json
