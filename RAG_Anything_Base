@@ -68,6 +68,22 @@ else:
     print(f"[huggingface] ⚠ 캐시 폴더 없음: {_HF_CACHE}")
     print("[huggingface] docling PDF 파싱이 실패하면, 인터넷 PC의 ~/.cache/huggingface 를 복사하세요.")
 
+# ──────────────────────────────────────────────────────────────────────────────
+#  ★ docling GPU 가속 ★
+#  docling 파싱(레이아웃/표 인식)을 GPU로 돌려 속도를 높인다.
+#  PyTorch가 CUDA 빌드여야 효과가 있다 (torch.cuda.is_available() == True).
+#  CUDA가 없으면 docling이 자동으로 CPU로 폴백하므로 켜둬도 안전하다.
+# ──────────────────────────────────────────────────────────────────────────────
+os.environ.setdefault("DOCLING_DEVICE", "cuda")
+try:
+    import torch as _torch
+    if _torch.cuda.is_available():
+        print(f"[docling] GPU 가속 ON — CUDA 사용 가능 ({_torch.cuda.get_device_name(0)})")
+    else:
+        print("[docling] ⚠ CUDA 사용 불가 → CPU로 동작 (PyTorch가 CPU 빌드일 수 있음)")
+except Exception:
+    pass
+
 import re
 import json
 import asyncio
@@ -217,6 +233,15 @@ def build_rag_instance(working_dir: str, cfg: dict):
     from lightrag.llm.ollama import ollama_model_complete, ollama_embed
     from lightrag.utils import EmbeddingFunc
 
+    # 멀티모달(이미지/표/수식) 호출용 저수준 함수.
+    # ollama_model_complete 는 hashing_kv(내부 캐시 객체)를 필수로 기대하는데
+    # 멀티모달 경로에서는 이게 주입되지 않아 'hashing_kv' KeyError 가 난다.
+    # ollama_complete_if_cache 는 hashing_kv 의존이 없어 멀티모달에 안전하다.
+    try:
+        from lightrag.llm.ollama import ollama_complete_if_cache as _ollama_raw
+    except ImportError:
+        _ollama_raw = None
+
     base_url    = cfg["ollama_base_url"]
     llm_model   = cfg["llm_model"]
     vlm_model   = cfg["vlm_model"]
@@ -235,23 +260,24 @@ def build_rag_instance(working_dir: str, cfg: dict):
         )
 
     # ── VLM 함수 (이미지 처리) ────────────────────────────────────
-    # lightrag는 멀티모달 호출 시 hashing_kv 등 내부 kwargs를 주입한다.
-    # ollama vision 호출에는 이 내부 kwargs를 넘기면 안 되므로 걸러낸다.
+    # 멀티모달 호출은 hashing_kv 의존이 없는 _ollama_raw 를 사용.
+    # _ollama_raw 의 첫 인자는 model 명, 두번째가 prompt (구버전 시그니처).
     def vision_model_func(prompt, system_prompt=None, history_messages=[],
                           image_data=None, messages=None, **kwargs):
-        # lightrag 내부 전용 kwargs 제거 (ollama가 모르는 인자)
+        # lightrag 내부 전용 kwargs 제거 (저수준 함수가 모르는 인자)
         _internal = {"hashing_kv", "keyword_extraction", "mode",
                      "enable_cot", "entity_extraction"}
-        clean_kwargs = {k: v for k, v in kwargs.items() if k not in _internal}
+        clean = {k: v for k, v in kwargs.items() if k not in _internal}
+
+        if _ollama_raw is None:
+            # 폴백: 저수준 함수가 없으면 텍스트 LLM으로 처리
+            return llm_model_func(prompt, system_prompt, history_messages)
 
         if messages:
-            return ollama_model_complete(
-                "",
-                system_prompt=None,
-                history_messages=[],
-                messages=messages,
-                host=base_url,
-                **clean_kwargs,
+            return _ollama_raw(
+                vlm_model, "",
+                system_prompt=None, history_messages=[],
+                messages=messages, host=base_url, **clean,
             )
         elif image_data:
             msg = []
@@ -267,16 +293,12 @@ def build_rag_instance(working_dir: str, cfg: dict):
                      }},
                 ],
             })
-            return ollama_model_complete(
-                "",
-                system_prompt=None,
-                history_messages=[],
-                messages=msg,
-                host=base_url,
-                **clean_kwargs,
+            return _ollama_raw(
+                vlm_model, "",
+                system_prompt=None, history_messages=[],
+                messages=msg, host=base_url, **clean,
             )
         else:
-            # 이미지 없는 일반 텍스트 → LLM으로 폴백
             return llm_model_func(prompt, system_prompt,
                                   history_messages, **kwargs)
 
