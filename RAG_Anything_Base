@@ -1,3 +1,45 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <title>Base64 to PDF HTML</title>
+</head>
+<body>
+
+    <button onclick="viewPdf()">PDF 보기</button>
+    <br><br>
+    
+    <iframe id="pdfFrame" width="100%" height="800px"></iframe>
+
+    <script>
+        // 변환된 Base64 문자열 (예시 - 실제 데이터로 대체하세요)
+        const base64Data = "YOUR_BASE64_STRING_HERE"; 
+
+        function viewPdf() {
+            // 1. Base64 디코딩 및 바이너리 배열 생성
+            const byteCharacters = atob(base64Data);
+            const byteNumbers = new Array(byteCharacters.length);
+            for (let i = 0; i < byteCharacters.length; i++) {
+                byteNumbers[i] = byteCharacters.charCodeAt(i);
+            }
+            const byteArray = new Uint8Array(byteNumbers);
+            
+            // 2. PDF 타입의 Blob 객체 생성
+            const blob = new Blob([byteArray], { type: 'application/pdf' });
+            
+            // 3. 가상 URL(Blob URL) 생성
+            const blobUrl = URL.createObjectURL(blob);
+            
+            // 4. iframe의 src에 바인딩하여 화면에 표시
+            document.getElementById('pdfFrame').src = blobUrl;
+        }
+    </script>
+</body>
+</html>
+
+
+
+
 """
 RAG Studio (Gradio Edition) - RAG-Anything 기반 멀티모달 RAG 관리 및 Q&A 웹앱
 요구사항: gradio>=6.0, raganything, lightrag-hku, ollama
