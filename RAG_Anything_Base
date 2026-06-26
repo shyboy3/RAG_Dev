@@ -7,17 +7,16 @@ def describe_image(img_path, base_url="http://localhost:11434"):
         "model": "qwen2.5vl:7b",
         "messages": [{
             "role": "user",
-            "content": "이 과학 이미지를 상세히 설명해줘. 보이는 객체, 구조, 특징을 구체적으로.",
+            "content": "이 이미지를 설명해줘.",
             "images": [b64]
         }],
         "stream": False
-    })
+    }, proxies={"http": None, "https": None})   # ← 프록시 우회 강제
+    print("상태코드:", resp.status_code)
+    print("응답 원문(앞 300자):", resp.text[:300])   # ← JSON 파싱 전에 원문 확인
     return resp.json()["message"]["content"]
 
-# 테스트
 desc = describe_image("test.jpg")
-print("VLM 설명:", desc[:300])
-
 
 
 import os
