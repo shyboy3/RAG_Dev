@@ -1,3 +1,25 @@
+import requests, base64
+
+def describe_image(img_path, base_url="http://localhost:11434"):
+    with open(img_path, "rb") as f:
+        b64 = base64.b64encode(f.read()).decode()
+    resp = requests.post(f"{base_url}/api/chat", json={
+        "model": "qwen2.5vl:7b",
+        "messages": [{
+            "role": "user",
+            "content": "이 과학 이미지를 상세히 설명해줘. 보이는 객체, 구조, 특징을 구체적으로.",
+            "images": [b64]
+        }],
+        "stream": False
+    })
+    return resp.json()["message"]["content"]
+
+# 테스트
+desc = describe_image("test.jpg")
+print("VLM 설명:", desc[:300])
+
+
+
 import os
 os.environ["NO_PROXY"] = "localhost,127.0.0.1"
 os.environ["TIKTOKEN_CACHE_DIR"] = r"C:\tiktoken_cache"
