@@ -1,39 +1,30 @@
-import requests, base64
-
-def describe_image(img_path, base_url="http://localhost:11434"):
-    with open(img_path, "rb") as f:
-        b64 = base64.b64encode(f.read()).decode()
-    resp = requests.post(f"{base_url}/api/chat", json={
-        "model": "qwen2.5vl:7b",
-        "messages": [{
-            "role": "user",
-            "content": "이 이미지를 설명해줘.",
-            "images": [b64]
-        }],
-        "stream": False
-    }, proxies={"http": None, "https": None})   # ← 프록시 우회 강제
-    print("상태코드:", resp.status_code)
-    print("응답 원문(앞 300자):", resp.text[:300])   # ← JSON 파싱 전에 원문 확인
-    return resp.json()["message"]["content"]
-
-desc = describe_image("test.jpg")
-
-
 import os
 os.environ["NO_PROXY"] = "localhost,127.0.0.1"
 os.environ["TIKTOKEN_CACHE_DIR"] = r"C:\tiktoken_cache"
 os.environ["HF_HUB_OFFLINE"] = "1"
 os.environ["TRANSFORMERS_OFFLINE"] = "1"
 
-import asyncio, base64, traceback
+import asyncio, base64, requests, traceback
 from lightrag import LightRAG, QueryParam
-from lightrag.llm.ollama import ollama_model_complete, ollama_embed, ollama_complete_if_cache
+from lightrag.llm.ollama import ollama_model_complete, ollama_embed
 from lightrag.utils import EmbeddingFunc
 
-BASE = "http://localhost:11434"   # 포트 바꿨으면 여기 수정
+BASE = "http://localhost:11434"   # 포트 바꿨으면 수정
+
+def describe_image(img_path):
+    with open(img_path, "rb") as f:
+        b64 = base64.b64encode(f.read()).decode()
+    resp = requests.post(f"{BASE}/api/chat", json={
+        "model": "qwen2.5vl:7b",
+        "messages": [{"role": "user",
+            "content": "이 과학 이미지를 상세히 설명해줘. 객체, 구조, 특징을 구체적으로.",
+            "images": [b64]}],
+        "stream": False
+    }, proxies={"http": None, "https": None})
+    return resp.json()["message"]["content"]
 
 rag = LightRAG(
-    working_dir="./test_image",
+    working_dir="./test_image_full",
     llm_model_func=lambda p, system_prompt=None, history_messages=[], **kw:
         ollama_model_complete(p, system_prompt=system_prompt,
             history_messages=history_messages, host=BASE, **kw),
@@ -42,27 +33,19 @@ rag = LightRAG(
         func=lambda texts: ollama_embed(texts, embed_model="nomic-embed-text", host=BASE)),
 )
 
-def describe_image(img_path):
-    with open(img_path, "rb") as f:
-        b64 = base64.b64encode(f.read()).decode()
-    msg = [{"role": "user", "content": [
-        {"type": "text", "text": "이 과학 이미지를 상세히 설명해줘. 보이는 객체, 구조, 특징을 구체적으로."},
-        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}]}]
-    return ollama_complete_if_cache("qwen2.5vl:7b", "", messages=msg, host=BASE)
-
 async def run():
     await rag.initialize_storages()
     from lightrag.kg.shared_storage import initialize_pipeline_status
     await initialize_pipeline_status()
 
     desc = describe_image("test.jpg")   # ← 실제 이미지 경로
-    print("VLM 설명:", desc[:200])
+    print("VLM 설명 완료")
 
-    await rag.ainsert(f"[이미지: test.jpg]\n{desc}")
+    await rag.ainsert(f"[이미지 파일: test.jpg]\n{desc}")
     print("✅ 이미지 인덱싱 성공")
 
     ans = await rag.aquery("이미지에 뭐가 있어?", param=QueryParam(mode="hybrid"))
-    print("✅ Q&A:", ans[:200])
+    print("✅ Q&A:", ans[:300])
 
 try:
     asyncio.run(run())
