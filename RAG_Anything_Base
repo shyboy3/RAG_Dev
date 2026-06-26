@@ -86,6 +86,16 @@ except Exception:
     os.environ.setdefault("DOCLING_DEVICE", "cpu")
     print("[docling] CPU 모드로 동작")
 
+# ──────────────────────────────────────────────────────────────────────────────
+#  ★ LightRAG 타임아웃/동시성 설정 ★
+#  qwen3:8b 같은 reasoning 모델은 청크당 추론이 길어 기본 타임아웃(360s)을
+#  넘기기 쉽다. 타임아웃을 늘리고 동시 처리 수를 조정한다.
+# ──────────────────────────────────────────────────────────────────────────────
+os.environ.setdefault("TIMEOUT", "900")          # LLM 호출 타임아웃 900초로
+os.environ.setdefault("LLM_TIMEOUT", "900")
+os.environ.setdefault("MAX_ASYNC", "2")          # 동시 LLM 호출 수 (GPU 1장이면 2~4)
+os.environ.setdefault("EMBEDDING_FUNC_MAX_ASYNC", "4")
+
 import re
 import json
 import base64
@@ -263,47 +273,50 @@ def build_rag_instance(working_dir: str, cfg: dict):
         )
 
     # ── VLM 함수 (이미지 처리) ────────────────────────────────────
-    # 멀티모달 호출은 hashing_kv 의존이 없는 _ollama_raw 를 사용.
-    # _ollama_raw 의 첫 인자는 model 명, 두번째가 prompt (구버전 시그니처).
+    # raganything의 modal processor는 vision 함수를 호출할 때 lightrag 캐시
+    # 객체(hashing_kv)를 넘기지 않는다. ollama_model_complete 는 hashing_kv 를
+    # 필수로 기대하므로 'hashing_kv' KeyError 가 발생한다.
+    # → Ollama HTTP API를 직접 호출(requests)해서 이 의존성을 완전히 우회한다.
+    import requests as _requests
+
     def vision_model_func(prompt, system_prompt=None, history_messages=[],
                           image_data=None, messages=None, **kwargs):
-        # lightrag 내부 전용 kwargs 제거 (저수준 함수가 모르는 인자)
-        _internal = {"hashing_kv", "keyword_extraction", "mode",
-                     "enable_cot", "entity_extraction"}
-        clean = {k: v for k, v in kwargs.items() if k not in _internal}
+        url = base_url.rstrip("/") + "/api/chat"
+        proxies = {"http": None, "https": None}   # 사내 프록시 우회
 
-        if _ollama_raw is None:
-            # 폴백: 저수준 함수가 없으면 텍스트 LLM으로 처리
-            return llm_model_func(prompt, system_prompt, history_messages)
-
+        # 1) messages 형식이 직접 주어진 경우 (VLM enhanced query)
         if messages:
-            return _ollama_raw(
-                vlm_model, "",
-                system_prompt=None, history_messages=[],
-                messages=messages, host=base_url, **clean,
-            )
-        elif image_data:
+            payload = {"model": vlm_model, "messages": messages, "stream": False}
+            r = _requests.post(url, json=payload, proxies=proxies, timeout=600)
+            r.raise_for_status()
+            return r.json()["message"]["content"]
+
+        # 2) 이미지 데이터가 있는 경우 (인덱싱 중 이미지/표/수식 설명 생성)
+        if image_data:
             msg = []
             if system_prompt:
                 msg.append({"role": "system", "content": system_prompt})
             msg.append({
                 "role": "user",
-                "content": [
-                    {"type": "text", "text": prompt},
-                    {"type": "image_url",
-                     "image_url": {
-                         "url": f"data:image/jpeg;base64,{image_data}"
-                     }},
-                ],
+                "content": prompt,
+                "images": [image_data],   # Ollama는 images 필드에 base64
             })
-            return _ollama_raw(
-                vlm_model, "",
-                system_prompt=None, history_messages=[],
-                messages=msg, host=base_url, **clean,
-            )
-        else:
-            return llm_model_func(prompt, system_prompt,
-                                  history_messages, **kwargs)
+            payload = {"model": vlm_model, "messages": msg, "stream": False}
+            r = _requests.post(url, json=payload, proxies=proxies, timeout=600)
+            r.raise_for_status()
+            return r.json()["message"]["content"]
+
+        # 3) 이미지 없는 순수 텍스트 → 일반 LLM으로 처리
+        msg = []
+        if system_prompt:
+            msg.append({"role": "system", "content": system_prompt})
+        for h in (history_messages or []):
+            msg.append(h)
+        msg.append({"role": "user", "content": prompt})
+        payload = {"model": llm_model, "messages": msg, "stream": False}
+        r = _requests.post(url, json=payload, proxies=proxies, timeout=600)
+        r.raise_for_status()
+        return r.json()["message"]["content"]
 
     # ── 임베딩 함수 ───────────────────────────────────────────────
     embedding_func = EmbeddingFunc(
