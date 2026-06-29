@@ -1,1066 +1,517 @@
-<!DOCTYPE html>
-<html lang="ko">
-<head>
-    <meta charset="UTF-8">
-    <title>Base64 to PDF HTML</title>
-</head>
-<body>
-
-    <button onclick="viewPdf()">PDF 보기</button>
-    <br><br>
-    
-    <iframe id="pdfFrame" width="100%" height="800px"></iframe>
-
-    <script>
-        // 변환된 Base64 문자열 (예시 - 실제 데이터로 대체하세요)
-        const base64Data = "YOUR_BASE64_STRING_HERE"; 
-
-        function viewPdf() {
-            // 1. Base64 디코딩 및 바이너리 배열 생성
-            const byteCharacters = atob(base64Data);
-            const byteNumbers = new Array(byteCharacters.length);
-            for (let i = 0; i < byteCharacters.length; i++) {
-                byteNumbers[i] = byteCharacters.charCodeAt(i);
-            }
-            const byteArray = new Uint8Array(byteNumbers);
-            
-            // 2. PDF 타입의 Blob 객체 생성
-            const blob = new Blob([byteArray], { type: 'application/pdf' });
-            
-            // 3. 가상 URL(Blob URL) 생성
-            const blobUrl = URL.createObjectURL(blob);
-            
-            // 4. iframe의 src에 바인딩하여 화면에 표시
-            document.getElementById('pdfFrame').src = blobUrl;
-        }
-    </script>
-</body>
-</html>
-
-
-
-
+# -*- coding: utf-8 -*-
 """
-RAG Studio (Gradio Edition) - RAG-Anything 기반 멀티모달 RAG 관리 및 Q&A 웹앱
-요구사항: gradio>=6.0, raganything, lightrag-hku, ollama
-실행: python rag_studio_gradio.py  →  브라우저에서 http://localhost:7860
+Docling Studio — 문서(PDF/PPTX/DOCX/XLSX/HTML) → (선택)base64 → DoclingDocument 변환 GUI
 
-특징:
-- 여러 개의 RAG 시스템 생성/관리 (메타정보는 ~/.rag_studio 에 영구 저장)
-- 폴더 단위 파일 추가 (이미지/PDF/문서, 하위 폴더 재귀 탐색)
-- Ollama 로컬 LLM 기반 인덱싱 + Q&A (모델 선택 가능)
-- PyQt 의존성 없음 (브라우저 UI)
+설계 원칙
+---------
+1) base64 는 docling 파싱에 '필수'가 아니라 '선택적 전송/보존 레이어'다.
+   - docling.convert() 는 DocumentStream(메모리 바이트)을 직접 받는다.
+   - 따라서 흐름은: 파일 → bytes → (선택)base64 round-trip 검증/보존 → bytes → docling
+2) 출력은 graph-RAG 정본 + 투입용 두 층으로 분리한다.
+   - 정본: DoclingDocument JSON (reading order/표 셀/그림-캡션 무손실)
+   - 투입: Markdown (GFM). 이미지는 인라인 base64 금지 → REFERENCED 사이드카 파일.
+3) air-gapped 대응: 모델 artifacts_path 를 GUI에서 지정 가능.
+
+실행 (그쪽 rag311 환경):
+    pip 는 이미 설치돼 있다고 가정 (docling 2.106, gradio 5.x)
+    python docling_studio.py
 """
 
-import os
-
-# ──────────────────────────────────────────────────────────────────────────────
-#  ★ 오프라인/사내보안망 필수 설정 ★
-#  tiktoken(토크나이저)이 openaipublic.blob.core.windows.net 에서 인코딩 파일을
-#  다운로드하려다 보안망에서 막히면 LightRAG 초기화가 실패한다.
-#  → 인터넷 되는 PC에서 아래 폴더에 캐시를 만든 뒤 보안망 PC로 복사하고,
-#    이 경로를 지정하면 외부 통신 없이 동작한다.
-#
-#  [캐시 생성 방법 - 인터넷 되는 PC에서]
-#    import os
-#    os.environ["TIKTOKEN_CACHE_DIR"] = r"C:\tiktoken_cache"
-#    import tiktoken
-#    tiktoken.get_encoding("cl100k_base")   # 폴더에 파일 생성됨
-#  그 후 C:\tiktoken_cache 폴더를 보안망 PC의 같은 경로로 복사.
-# ──────────────────────────────────────────────────────────────────────────────
-_TIKTOKEN_CACHE = os.environ.get("TIKTOKEN_CACHE_DIR") or r"C:\tiktoken_cache"
-if os.path.isdir(_TIKTOKEN_CACHE):
-    os.environ["TIKTOKEN_CACHE_DIR"] = _TIKTOKEN_CACHE
-    print(f"[tiktoken] 오프라인 캐시 사용: {_TIKTOKEN_CACHE}")
-else:
-    print(f"[tiktoken] ⚠ 캐시 폴더 없음: {_TIKTOKEN_CACHE}")
-    print("[tiktoken] 보안망에서 인덱싱이 실패하면, 인터넷 PC에서 캐시를 만들어 복사하세요.")
-
-# ──────────────────────────────────────────────────────────────────────────────
-#  ★ 사내보안망 프록시 우회 ★
-#  HTTP(S)_PROXY 환경변수가 설정된 환경에서는 localhost:11434(Ollama) 요청까지
-#  프록시를 타서 HTML 에러를 돌려받는다. localhost를 프록시 예외로 등록.
-# ──────────────────────────────────────────────────────────────────────────────
-_existing_no_proxy = os.environ.get("NO_PROXY", "")
-_no_proxy_hosts = "localhost,127.0.0.1,::1"
-if _existing_no_proxy:
-    _no_proxy_hosts = _existing_no_proxy + "," + _no_proxy_hosts
-os.environ["NO_PROXY"] = _no_proxy_hosts
-os.environ["no_proxy"] = _no_proxy_hosts
-
-# ──────────────────────────────────────────────────────────────────────────────
-#  ★ HuggingFace 오프라인 모드 (docling 모델용) ★
-#  docling 파서가 레이아웃/구조 인식 모델을 HF Hub에서 받으려다 보안망 SSL
-#  검사에 막혀 실패한다. 인터넷 PC에서 받은 ~/.cache/huggingface 를 보안망 PC의
-#  같은 경로로 복사한 뒤, 아래 오프라인 모드를 켜면 캐시만 쓰고 외부 통신을 안 한다.
-#
-#  [docling 모델 캐시 생성 - 인터넷 PC에서]
-#    from docling.document_converter import DocumentConverter
-#    DocumentConverter().convert("아무.pdf")   # 모델 자동 다운로드
-#  → C:\Users\<사용자>\.cache\huggingface 폴더를 보안망 PC 같은 경로로 복사
-#    (Windows symlink 깨짐 방지: ZIP 압축 후 복사 권장)
-# ──────────────────────────────────────────────────────────────────────────────
-_HF_CACHE = os.path.expanduser(r"~\.cache\huggingface")
-if os.path.isdir(_HF_CACHE):
-    os.environ["HF_HUB_OFFLINE"] = "1"
-    os.environ["TRANSFORMERS_OFFLINE"] = "1"
-    os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
-    print(f"[huggingface] 오프라인 모드 ON — 캐시 사용: {_HF_CACHE}")
-else:
-    print(f"[huggingface] ⚠ 캐시 폴더 없음: {_HF_CACHE}")
-    print("[huggingface] docling PDF 파싱이 실패하면, 인터넷 PC의 ~/.cache/huggingface 를 복사하세요.")
-
-# ──────────────────────────────────────────────────────────────────────────────
-#  ★ docling 가속 디바이스 자동 설정 ★
-#  CUDA(GPU)가 있으면 GPU로, 없으면 CPU로 자동 설정한다.
-#  강제로 cuda를 지정하면 GPU 없는 환경에서 "CUDA is not available" 경고가
-#  반복 출력되므로, 실제 가용 여부를 먼저 확인해서 맞춘다.
-# ──────────────────────────────────────────────────────────────────────────────
-try:
-    import torch as _torch
-    if _torch.cuda.is_available():
-        os.environ.setdefault("DOCLING_DEVICE", "cuda")
-        print(f"[docling] GPU 가속 ON — CUDA 사용 ({_torch.cuda.get_device_name(0)})")
-    else:
-        os.environ.setdefault("DOCLING_DEVICE", "cpu")
-        print("[docling] CPU 모드로 동작 (GPU 가속을 원하면 PyTorch CUDA 빌드 설치)")
-except Exception:
-    os.environ.setdefault("DOCLING_DEVICE", "cpu")
-    print("[docling] CPU 모드로 동작")
-
-# ──────────────────────────────────────────────────────────────────────────────
-#  ★ LightRAG 타임아웃/동시성 설정 ★
-#  qwen3:8b 같은 reasoning 모델은 청크당 추론이 길어 기본 타임아웃(360s)을
-#  넘기기 쉽다. 타임아웃을 늘리고 동시 처리 수를 조정한다.
-# ──────────────────────────────────────────────────────────────────────────────
-os.environ.setdefault("TIMEOUT", "900")          # LLM 호출 타임아웃 900초로
-os.environ.setdefault("LLM_TIMEOUT", "900")
-os.environ.setdefault("MAX_ASYNC", "2")          # 동시 LLM 호출 수 (GPU 1장이면 2~4)
-os.environ.setdefault("EMBEDDING_FUNC_MAX_ASYNC", "4")
-
-import re
-import json
 import base64
-import asyncio
-import urllib.request
-from pathlib import Path
+import hashlib
+import io
+import json
+import shutil
+import traceback
+import zipfile
 from datetime import datetime
-from typing import Optional
+from pathlib import Path
 
-import inspect
 import gradio as gr
 
-# ──────────────────────────────────────────────────────────────────────────────
-#  Gradio 버전 호환 감지
-#  일부 환경에서 gradio 버전 표기는 6.x여도 Chatbot이 type 인자를 받지 못함
-#  (gradio_pdf 등 커스텀 컴포넌트 충돌). 런타임에 실제 시그니처로 판별.
-# ──────────────────────────────────────────────────────────────────────────────
+# ----------------------------------------------------------------------------
+# docling 임포트 (지연/방어적). 미설치 환경에서도 앱은 뜨고, 변환 시 안내한다.
+# ----------------------------------------------------------------------------
+DOCLING_IMPORT_ERROR = None
 try:
-    _CHATBOT_PARAMS = inspect.signature(gr.Chatbot.__init__).parameters
-    SUPPORTS_MESSAGES = "type" in _CHATBOT_PARAMS
+    from docling.document_converter import DocumentConverter, PdfFormatOption
+    from docling.datamodel.base_models import InputFormat, DocumentStream
+    from docling.datamodel.pipeline_options import PdfPipelineOptions
+    from docling_core.types.doc import ImageRefMode
+    DOCLING_AVAILABLE = True
+except Exception as e:  # pragma: no cover - 환경 의존
+    DOCLING_AVAILABLE = False
+    DOCLING_IMPORT_ERROR = f"{type(e).__name__}: {e}"
+
+# GPU 가속 옵션은 docling 버전마다 위치가 달라 별도 try
+ACCEL_AVAILABLE = False
+try:
+    from docling.datamodel.pipeline_options import AcceleratorOptions, AcceleratorDevice
+    ACCEL_AVAILABLE = True
 except Exception:
-    SUPPORTS_MESSAGES = False
+    AcceleratorOptions = None
+    AcceleratorDevice = None
 
-
-def make_chatbot(**kwargs):
-    """Chatbot 생성 — messages(dict) 형식 우선 시도.
-    type 인자를 받는 버전이면 messages 형식, 아니면 기본 형식."""
+# VLM(granite-docling via Ollama) 파이프라인. 임포트 위치가 버전마다 달라 두 경로 시도.
+VLM_AVAILABLE = False
+VLM_IMPORT_ERROR = None
+try:
+    from docling.pipeline.vlm_pipeline import VlmPipeline
+    from docling.datamodel.pipeline_options import VlmPipelineOptions
     try:
-        return gr.Chatbot(type="messages", **kwargs)
-    except (TypeError, Exception):
-        kwargs.pop("type", None)
-        return gr.Chatbot(**kwargs)
-
-
-def to_history_append(history, user_msg, assistant_msg):
-    """messages(dict) 형식으로 (질문, 답변) 한 쌍을 history에 추가.
-    Gradio 6.x는 dict 형식을 기대하므로 항상 dict로 통일."""
-    history = history or []
-    history.append({"role": "user", "content": str(user_msg)})
-    history.append({"role": "assistant", "content": str(assistant_msg)})
-    return history
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-#  설정/저장 경로
-# ──────────────────────────────────────────────────────────────────────────────
-APP_DIR = Path.home() / ".rag_studio"
-CONFIG_FILE = APP_DIR / "config.json"
-RAG_REGISTRY_FILE = APP_DIR / "rag_registry.json"
-RAG_DATA_DIR = APP_DIR / "rag_data"
-
-IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif", ".webp", ".gif"}
-PDF_EXTS = {".pdf"}
-DOC_EXTS = {".ppt", ".pptx", ".csv", ".xlsx", ".xls", ".txt", ".md", ".json"}
-ALL_EXTS = IMAGE_EXTS | PDF_EXTS | DOC_EXTS
-
-DEFAULT_CONFIG = {
-    "ollama_base_url": "http://localhost:11434",
-    "llm_model": "qwen3:8b",
-    "vlm_model": "qwen2.5vl:7b",
-    "embedding_model": "bge-m3",
-    "embedding_dim": 1024,
-    "num_ctx": 32768,
-    "parser": "docling",
-    "query_mode": "hybrid",
-}
-
-
-def ensure_dirs():
-    APP_DIR.mkdir(parents=True, exist_ok=True)
-    RAG_DATA_DIR.mkdir(parents=True, exist_ok=True)
-
-
-def load_config() -> dict:
-    ensure_dirs()
-    cfg = dict(DEFAULT_CONFIG)
-    if CONFIG_FILE.exists():
-        try:
-            cfg.update(json.loads(CONFIG_FILE.read_text(encoding="utf-8")))
-        except Exception:
-            pass
-    return cfg
-
-
-def save_config(cfg: dict):
-    ensure_dirs()
-    CONFIG_FILE.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
-def load_registry() -> dict:
-    ensure_dirs()
-    if RAG_REGISTRY_FILE.exists():
-        try:
-            return json.loads(RAG_REGISTRY_FILE.read_text(encoding="utf-8"))
-        except Exception:
-            pass
-    return {}
-
-
-def save_registry(reg: dict):
-    ensure_dirs()
-    RAG_REGISTRY_FILE.write_text(json.dumps(reg, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
-def safe_dirname(name: str) -> str:
-    s = re.sub(r"[^\w가-힣\-]", "_", name.strip())
-    return s or "rag"
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-#  Ollama 헬퍼
-# ──────────────────────────────────────────────────────────────────────────────
-def fetch_ollama_models(base_url: str) -> list:
-    try:
-        url = base_url.rstrip("/") + "/api/tags"
-        with urllib.request.urlopen(url, timeout=5) as resp:
-            data = json.loads(resp.read())
-        return [m["name"] for m in data.get("models", [])]
+        from docling.datamodel.pipeline_options_vlm_model import ApiVlmOptions, ResponseFormat
     except Exception:
-        return []
+        from docling.datamodel.pipeline_options import ApiVlmOptions, ResponseFormat
+    VLM_AVAILABLE = True
+except Exception as e:  # pragma: no cover - 환경 의존
+    VLM_IMPORT_ERROR = f"{type(e).__name__}: {e}"
+
+# docling 이 직접 파싱하는 확장자 (legacy .doc/.ppt 는 제외 → soffice 변환 안내)
+SUPPORTED_EXT = {".pdf", ".docx", ".pptx", ".xlsx", ".html", ".htm", ".md", ".csv", ".png", ".jpg", ".jpeg", ".tiff", ".bmp"}
+LEGACY_EXT = {".doc", ".ppt", ".xls"}
+
+WORK_ROOT = Path("./docling_out").resolve()
+WORK_ROOT.mkdir(parents=True, exist_ok=True)
 
 
-def test_ollama(base_url: str) -> str:
-    try:
-        url = base_url.rstrip("/") + "/api/tags"
-        with urllib.request.urlopen(url, timeout=4) as resp:
-            data = json.loads(resp.read())
-        n = len(data.get("models", []))
-        return f"✅ 연결 성공 — 설치된 모델 {n}개"
-    except Exception as e:
-        return f"❌ 연결 실패: {e}"
+# ----------------------------------------------------------------------------
+# 작은 유틸들
+# ----------------------------------------------------------------------------
+def sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-#  RAG-Anything 인스턴스 빌더 (인덱싱/쿼리 공용)
-# ──────────────────────────────────────────────────────────────────────────────
-def build_rag_instance(working_dir: str, cfg: dict):
-    """RAGAnything 인스턴스 생성 — 공식 README 패턴 그대로.
+def bytes_to_b64(data: bytes, notepad_style: bool = False, wrap: int = 76) -> str:
+    """표준(한 줄) 또는 Notepad++/MIME 스타일(wrap자마다 줄바꿈) base64.
 
-    핵심 (공식 문서 확인):
-      - RAGAnything(working_dir=, llm_model_func=, vision_model_func=, embedding_func=)
-        → config 객체 없이 직접 인자 전달
-      - llm_model_func 는 lambda 래퍼로 감싸고 **kwargs 그대로 전달
-      - ollama_model_complete 는 model 인자를 첫 인자 다음에 받지 않고,
-        kwargs로 받음 → lambda 안에서 직접 호출
+    notepad_style=True 면 RFC 2045 처럼 wrap(기본 76)자마다 개행을 넣어
+    Notepad++ MIME Tools 등 다른 도구의 출력과 문자열까지 맞춘다.
+    줄바꿈은 표현 차이일 뿐 디코딩 결과(데이터)는 표준과 동일하다.
     """
-    from raganything import RAGAnything
-    from lightrag.llm.ollama import ollama_model_complete, ollama_embed
-    from lightrag.utils import EmbeddingFunc
+    raw_b64 = base64.b64encode(data).decode("ascii")
+    if not notepad_style:
+        return raw_b64
+    w = max(1, int(wrap))
+    return "\n".join(raw_b64[i:i + w] for i in range(0, len(raw_b64), w))
 
-    # 멀티모달(이미지/표/수식) 호출용 저수준 함수.
-    # ollama_model_complete 는 hashing_kv(내부 캐시 객체)를 필수로 기대하는데
-    # 멀티모달 경로에서는 이게 주입되지 않아 'hashing_kv' KeyError 가 난다.
-    # ollama_complete_if_cache 는 hashing_kv 의존이 없어 멀티모달에 안전하다.
-    try:
-        from lightrag.llm.ollama import ollama_complete_if_cache as _ollama_raw
-    except ImportError:
-        _ollama_raw = None
 
-    base_url    = cfg["ollama_base_url"]
-    llm_model   = cfg["llm_model"]
-    vlm_model   = cfg["vlm_model"]
-    embed_model = cfg["embedding_model"]
-    embed_dim   = int(cfg["embedding_dim"])
-    num_ctx     = int(cfg["num_ctx"])
+def b64_to_bytes(text: str) -> bytes:
+    # data URL 접두( data:...;base64, ) 가 붙어 있으면 떼어낸다
+    if "," in text and text.strip().lower().startswith("data:"):
+        text = text.split(",", 1)[1]
+    return base64.b64decode(text.strip(), validate=False)
 
-    # ── LLM 함수 (검증된 단순 래퍼) ───────────────────────────────
-    def llm_model_func(prompt, system_prompt=None, history_messages=[], **kwargs):
-        return ollama_model_complete(
-            prompt,
-            system_prompt=system_prompt,
-            history_messages=history_messages,
-            host=base_url,
-            **kwargs,
+
+def maybe_convert_legacy(src: Path, out_dir: Path) -> Path:
+    """legacy .doc/.ppt/.xls 는 soffice(LibreOffice) headless 로 .docx/.pptx/.xlsx 변환 시도."""
+    target = {".doc": "docx", ".ppt": "pptx", ".xls": "xlsx"}[src.suffix.lower()]
+    soffice = shutil.which("soffice") or shutil.which("libreoffice")
+    if not soffice:
+        raise RuntimeError(
+            f"'{src.suffix}' 는 docling 이 직접 못 읽어요. LibreOffice(soffice) 가 없어 자동 변환도 불가합니다. "
+            f"먼저 .{target} 로 저장해 주세요."
         )
+    import subprocess
+    subprocess.run(
+        [soffice, "--headless", "--convert-to", target, "--outdir", str(out_dir), str(src)],
+        check=True, capture_output=True, timeout=120,
+    )
+    converted = out_dir / (src.stem + "." + target)
+    if not converted.exists():
+        raise RuntimeError(f"soffice 변환 결과를 찾지 못했어요: {converted}")
+    return converted
 
-    # ── VLM 함수 (이미지 처리) ────────────────────────────────────
-    # raganything의 modal processor는 vision 함수를 호출할 때 lightrag 캐시
-    # 객체(hashing_kv)를 넘기지 않는다. ollama_model_complete 는 hashing_kv 를
-    # 필수로 기대하므로 'hashing_kv' KeyError 가 발생한다.
-    # → Ollama HTTP API를 직접 호출(requests)해서 이 의존성을 완전히 우회한다.
-    import requests as _requests
 
-    def vision_model_func(prompt, system_prompt=None, history_messages=[],
-                          image_data=None, messages=None, **kwargs):
-        url = base_url.rstrip("/") + "/api/chat"
-        proxies = {"http": None, "https": None}   # 사내 프록시 우회
+def _build_standard(artifacts_path, do_ocr, gen_images, images_scale, use_gpu):
+    """기본 파이프라인: DocLayNet 레이아웃 + TableFormer 표 모델."""
+    opts = PdfPipelineOptions()
+    opts.do_ocr = bool(do_ocr)
+    opts.generate_picture_images = bool(gen_images)
+    opts.generate_page_images = bool(gen_images)
+    try:
+        opts.images_scale = float(images_scale)
+    except Exception:
+        pass
 
-        # 1) messages 형식이 직접 주어진 경우 (VLM enhanced query)
-        if messages:
-            payload = {"model": vlm_model, "messages": messages, "stream": False}
-            r = _requests.post(url, json=payload, proxies=proxies, timeout=600)
-            r.raise_for_status()
-            return r.json()["message"]["content"]
+    ap = (artifacts_path or "").strip()
+    if ap:
+        opts.artifacts_path = ap  # 사전 다운로드한 모델 경로 (air-gapped)
 
-        # 2) 이미지 데이터가 있는 경우 (인덱싱 중 이미지/표/수식 설명 생성)
-        if image_data:
-            msg = []
-            if system_prompt:
-                msg.append({"role": "system", "content": system_prompt})
-            msg.append({
-                "role": "user",
-                "content": prompt,
-                "images": [image_data],   # Ollama는 images 필드에 base64
-            })
-            payload = {"model": vlm_model, "messages": msg, "stream": False}
-            r = _requests.post(url, json=payload, proxies=proxies, timeout=600)
-            r.raise_for_status()
-            return r.json()["message"]["content"]
+    if use_gpu and ACCEL_AVAILABLE:
+        try:
+            opts.accelerator_options = AcceleratorOptions(
+                num_threads=8, device=AcceleratorDevice.CUDA
+            )
+        except Exception:
+            pass
 
-        # 3) 이미지 없는 순수 텍스트 → 일반 LLM으로 처리
-        msg = []
-        if system_prompt:
-            msg.append({"role": "system", "content": system_prompt})
-        for h in (history_messages or []):
-            msg.append(h)
-        msg.append({"role": "user", "content": prompt})
-        payload = {"model": llm_model, "messages": msg, "stream": False}
-        r = _requests.post(url, json=payload, proxies=proxies, timeout=600)
-        r.raise_for_status()
-        return r.json()["message"]["content"]
-
-    # ── 임베딩 함수 ───────────────────────────────────────────────
-    embedding_func = EmbeddingFunc(
-        embedding_dim=embed_dim,
-        max_token_size=8192,
-        func=lambda texts: ollama_embed(
-            texts,
-            embed_model=embed_model,
-            host=base_url,
-        ),
+    return DocumentConverter(
+        format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=opts)}
     )
 
-    # ── RAGAnythingConfig (working_dir는 여기에) ──────────────────
-    from raganything import RAGAnythingConfig
-    config = RAGAnythingConfig(
-        working_dir=working_dir,
-        parser=cfg.get("parser", "docling"),
-        parse_method="auto",
-        enable_image_processing=True,
-        enable_table_processing=True,
-        enable_equation_processing=True,
+
+def _build_granite_ollama(ollama_url, model_name, images_scale, gen_images):
+    """granite-docling VLM 파이프라인을 Ollama(OpenAI 호환 엔드포인트)로 구동.
+
+    Ollama 는 /v1/chat/completions 를 노출하므로 ApiVlmOptions 로 가리킨다.
+    granite-docling 출력은 DocTags 포맷이다.
+    """
+    if not VLM_AVAILABLE:
+        raise RuntimeError(f"VLM 파이프라인 임포트 실패: {VLM_IMPORT_ERROR} (docling 버전 확인)")
+
+    base = (ollama_url or "http://localhost:11434").rstrip("/")
+    if not base.endswith("/v1/chat/completions"):
+        base = base + "/v1/chat/completions"
+
+    # 로컬 Ollama 는 회사 프록시를 타면 안 된다 → NO_PROXY 보강
+    import os
+    host = base.split("//", 1)[-1].split("/", 1)[0].split(":", 1)[0]
+    for var in ("NO_PROXY", "no_proxy"):
+        cur = os.environ.get(var, "")
+        if host not in cur:
+            os.environ[var] = (cur + "," if cur else "") + host + ",localhost,127.0.0.1"
+
+    api_opts = ApiVlmOptions(
+        url=base,
+        params={"model": model_name or "ibm/granite-docling"},
+        prompt="Convert this page to docling.",
+        timeout=180,
+        scale=float(images_scale) if images_scale else 2.0,
+        response_format=ResponseFormat.DOCTAGS,
     )
 
-    # ── RAGAnything (검증된 패턴) ─────────────────────────────────
-    # host/num_ctx 는 위 llm_model_func 래퍼에서 이미 처리하므로
-    # lightrag_kwargs 에는 모델명만 전달 (검증 완료된 최소 구성)
-    rag = RAGAnything(
-        config=config,
-        llm_model_func=llm_model_func,
-        vision_model_func=vision_model_func,
-        embedding_func=embedding_func,
-        lightrag_kwargs={
-            "llm_model_name": llm_model,
-        },
-    )
-    return rag
+    vlm_opts = VlmPipelineOptions(enable_remote_services=True)
+    vlm_opts.vlm_options = api_opts
+    try:
+        vlm_opts.generate_picture_images = bool(gen_images)
+    except Exception:
+        pass
+
+    pdf_fmt = PdfFormatOption(pipeline_cls=VlmPipeline, pipeline_options=vlm_opts)
+    fmts = {InputFormat.PDF: pdf_fmt}
+    try:  # 이미지 입력도 VLM 으로
+        fmts[InputFormat.IMAGE] = pdf_fmt
+    except Exception:
+        pass
+    return DocumentConverter(format_options=fmts)
 
 
-def describe_image_via_vlm(img_path: str, cfg: dict) -> str:
-    """이미지를 VLM(Ollama)으로 직접 설명. MinerU 우회.
-    프록시 차단 환경 대응(proxies=None)."""
-    import requests as _rq
-    base_url = cfg["ollama_base_url"].rstrip("/")
-    vlm_model = cfg["vlm_model"]
-    with open(img_path, "rb") as f:
-        b64 = base64.b64encode(f.read()).decode()
-    resp = _rq.post(
-        f"{base_url}/api/chat",
-        json={
-            "model": vlm_model,
-            "messages": [{
-                "role": "user",
-                "content": ("이 과학 이미지를 상세히 설명해줘. "
-                            "보이는 객체, 구조, 수치, 특징을 구체적으로 기술해."),
-                "images": [b64],
-            }],
-            "stream": False,
-        },
-        proxies={"http": None, "https": None},   # 사내 프록시 우회
-        timeout=300,
-    )
-    resp.raise_for_status()
-    return resp.json()["message"]["content"]
+def build_converter(engine, artifacts_path, do_ocr, gen_images, images_scale,
+                    use_gpu, ollama_url, model_name):
+    """엔진 선택에 따라 컨버터 생성. DOCX/PPTX 등은 두 경우 모두 native 파서가 처리."""
+    if engine and engine.startswith("granite"):
+        return _build_granite_ollama(ollama_url, model_name, images_scale, gen_images)
+    return _build_standard(artifacts_path, do_ocr, gen_images, images_scale, use_gpu)
 
 
-def scan_folder(folder: str, ftype: str) -> list:
-    if not folder or not Path(folder).is_dir():
-        return []
-    exts = {"image": IMAGE_EXTS, "pdf": PDF_EXTS, "doc": DOC_EXTS}.get(ftype, ALL_EXTS)
-    return [str(p) for p in Path(folder).rglob("*")
-            if p.is_file() and p.suffix.lower() in exts]
+# ----------------------------------------------------------------------------
+# 핵심 변환 한 건
+# ----------------------------------------------------------------------------
+def process_one(src_path: Path, converter, out_dir: Path,
+                roundtrip_b64: bool, embed_b64: bool) -> dict:
+    """파일 1개 → DoclingDocument. 결과 메타 dict 반환."""
+    orig_raw = src_path.read_bytes()      # 사용자가 올린 '진짜 원본'
+    orig_sha = sha256_bytes(orig_raw)
+    orig_size = len(orig_raw)
 
+    log_lines = [f"· 원본: {src_path.name} ({orig_size:,} bytes)  sha256={orig_sha[:12]}…"]
 
-# ──────────────────────────────────────────────────────────────────────────────
-#  비즈니스 로직 (Gradio 콜백)
-# ──────────────────────────────────────────────────────────────────────────────
-def get_rag_choices() -> list:
-    reg = load_registry()
-    return list(reg.keys())
+    # legacy 포맷 변환 (.doc/.ppt/.xls → docx/pptx/xlsx). work_raw = docling 에 먹일 바이트
+    work_src = src_path
+    work_raw = orig_raw
+    converted = False
+    if src_path.suffix.lower() in LEGACY_EXT:
+        work_src = maybe_convert_legacy(src_path, out_dir)
+        work_raw = work_src.read_bytes()
+        converted = True
+        log_lines.append(f"· legacy 변환 → {work_src.name} ({len(work_raw):,} bytes)")
 
+    # (선택) base64 round-trip 무결성 검증 — docling 에 먹일 바이트 기준
+    if roundtrip_b64:
+        restored = b64_to_bytes(bytes_to_b64(work_raw))
+        ok = sha256_bytes(restored) == sha256_bytes(work_raw)
+        tgt = "변환본" if converted else "원본"
+        log_lines.append(f"· base64 round-trip 무결성({tgt}): {'OK ✔' if ok else '불일치 ✗'}")
+        if not ok:
+            raise RuntimeError("base64 round-trip 해시 불일치 — 인코딩 손상")
+        decoded = restored
+    else:
+        decoded = work_raw
 
-def create_rag(name: str, description: str):
-    name = (name or "").strip()
-    if not name:
-        return gr.update(), "⚠ RAG 이름을 입력하세요.", gr.update(), gr.update()
-    reg = load_registry()
-    if name in reg:
-        return gr.update(), f"⚠ '{name}' 이름이 이미 존재합니다.", gr.update(), gr.update()
+    # docling 변환 (메모리 스트림으로 직접 — 임시 파일 불필요)
+    stream = DocumentStream(name=work_src.name, stream=io.BytesIO(decoded))
+    result = converter.convert(stream)
+    doc = result.document
 
-    working_dir = str(RAG_DATA_DIR / safe_dirname(name))
-    Path(working_dir).mkdir(parents=True, exist_ok=True)
-    reg[name] = {
-        "working_dir": working_dir,
-        "description": description.strip(),
-        "created_at": datetime.now().isoformat(),
-        "file_count": 0,
+    stem = src_path.stem
+    case_dir = out_dir / stem
+    case_dir.mkdir(parents=True, exist_ok=True)
+
+    # 1) 정본: DoclingDocument JSON
+    json_path = case_dir / f"{stem}.docling.json"
+    try:
+        doc.save_as_json(json_path)
+    except Exception:
+        json_path.write_text(json.dumps(doc.export_to_dict(), ensure_ascii=False, indent=2),
+                             encoding="utf-8")
+
+    # 2) 투입용: Markdown + REFERENCED 이미지 사이드카 (인라인 base64 금지)
+    md_path = case_dir / f"{stem}.md"
+    try:
+        doc.save_as_markdown(md_path, image_mode=ImageRefMode.REFERENCED)
+    except Exception:
+        md_path.write_text(doc.export_to_markdown(), encoding="utf-8")
+    md_text = md_path.read_text(encoding="utf-8")
+
+    # 3) provenance 봉투(JSON): 원본 메타 + (선택)원본 base64 + docling dict
+    src_meta = {
+        "filename": src_path.name,
+        "format": src_path.suffix.lower().lstrip("."),
+        "sha256": orig_sha,
+        "size_bytes": orig_size,
+        "ingested_at": datetime.now().isoformat(timespec="seconds"),
+        "base64": bytes_to_b64(orig_raw) if embed_b64 else None,  # 진짜 원본 기준
     }
-    save_registry(reg)
-    choices = list(reg.keys())
-    table = registry_to_table()
-    return (
-        gr.update(choices=choices, value=name),       # manage dropdown
-        f"✅ '{name}' RAG 생성 완료 → {working_dir}",
-        gr.update(choices=choices, value=name),       # qa dropdown
-        table,
-    )
+    if converted:
+        # legacy → docling 입력은 변환본이므로 그 메타도 함께 기록
+        src_meta["converted_to"] = {
+            "filename": work_src.name,
+            "format": work_src.suffix.lower().lstrip("."),
+            "sha256": sha256_bytes(work_raw),
+            "size_bytes": len(work_raw),
+        }
+    envelope = {"source": src_meta, "docling": doc.export_to_dict()}
+    env_path = case_dir / f"{stem}.envelope.json"
+    env_path.write_text(json.dumps(envelope, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    # 추출된 그림 파일 목록 (사이드카)
+    imgs = sorted([p for p in case_dir.rglob("*")
+                   if p.suffix.lower() in {".png", ".jpg", ".jpeg"}])
+
+    log_lines.append(f"· 그림 사이드카: {len(imgs)}개")
+    log_lines.append(f"· 출력: {case_dir}")
+
+    return {
+        "name": src_path.name,
+        "case_dir": case_dir,
+        "json_path": json_path,
+        "md_path": md_path,
+        "env_path": env_path,
+        "md_text": md_text,
+        "images": [str(p) for p in imgs],
+        "log": "\n".join(log_lines),
+        "n_pages": getattr(doc, "num_pages", lambda: None)() if callable(getattr(doc, "num_pages", None)) else None,
+    }
 
 
-def delete_rag(name: str):
-    if not name:
-        return gr.update(), "⚠ 삭제할 RAG를 선택하세요.", gr.update(), gr.update()
-    reg = load_registry()
-    if name in reg:
-        del reg[name]
-        save_registry(reg)
-    choices = list(reg.keys())
-    new_val = choices[0] if choices else None
-    return (
-        gr.update(choices=choices, value=new_val),
-        f"🗑 '{name}' 제거됨 (실제 파일은 보존)",
-        gr.update(choices=choices, value=new_val),
-        registry_to_table(),
-    )
-
-
-def registry_to_table() -> list:
-    reg = load_registry()
-    rows = []
-    for name, info in reg.items():
-        rows.append([
-            name,
-            info.get("description", ""),
-            info.get("file_count", 0),
-            info.get("created_at", "")[:16].replace("T", " "),
-            info.get("working_dir", ""),
-        ])
-    return rows
-
-
-def preview_folder(folder_img, folder_pdf, folder_doc):
-    """세 폴더를 스캔해서 파일 목록 미리보기"""
-    files = []
-    files += scan_folder(folder_img, "image")
-    files += scan_folder(folder_pdf, "pdf")
-    files += scan_folder(folder_doc, "doc")
-    files = sorted(set(files))
+def run_pipeline(files, engine, artifacts_path, do_ocr, gen_images, images_scale,
+                 use_gpu, ollama_url, model_name, roundtrip_b64, embed_b64):
+    """Gradio 핸들러: 여러 파일 처리 → 미리보기 + zip 다운로드."""
+    if not DOCLING_AVAILABLE:
+        return (f"❌ docling 임포트 실패: {DOCLING_IMPORT_ERROR}\n"
+                f"   rag311 환경에서 실행했는지 확인하세요.", "", [], None, gr.update(choices=[], value=None))
     if not files:
-        return "스캔된 파일이 없습니다. 폴더 경로를 확인하세요.", files
-    by_type = {"이미지": 0, "PDF": 0, "문서": 0}
+        return "파일을 올려주세요.", "", [], None, gr.update(choices=[], value=None)
+
+    run_dir = WORK_ROOT / datetime.now().strftime("run_%Y%m%d_%H%M%S")
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        converter = build_converter(engine, artifacts_path, do_ocr, gen_images,
+                                    images_scale, use_gpu, ollama_url, model_name)
+    except Exception as e:
+        return f"❌ 컨버터 생성 실패: {e}\n{traceback.format_exc()}", "", [], None, gr.update(choices=[], value=None)
+
+    results, logs = [], []
     for f in files:
-        ext = Path(f).suffix.lower()
-        if ext in IMAGE_EXTS:
-            by_type["이미지"] += 1
-        elif ext in PDF_EXTS:
-            by_type["PDF"] += 1
-        else:
-            by_type["문서"] += 1
-    summary = (f"📊 총 **{len(files)}개** 파일 "
-               f"(이미지 {by_type['이미지']}, PDF {by_type['PDF']}, 문서 {by_type['문서']})\n\n")
-    preview = "\n".join(f"- {Path(f).name}" for f in files[:30])
-    if len(files) > 30:
-        preview += f"\n- ... 외 {len(files) - 30}개"
-    return summary + preview, files
+        src = Path(f.name if hasattr(f, "name") else f)
+        ext = src.suffix.lower()
+        if ext not in SUPPORTED_EXT and ext not in LEGACY_EXT:
+            logs.append(f"⏭  건너뜀(미지원 {ext}): {src.name}")
+            continue
+        try:
+            r = process_one(src, converter, run_dir, roundtrip_b64, embed_b64)
+            results.append(r)
+            logs.append(f"✅ {r['name']}\n{r['log']}")
+        except Exception as e:
+            logs.append(f"❌ {src.name}\n   {type(e).__name__}: {e}")
 
+    if not results:
+        return "\n\n".join(logs) or "처리된 파일이 없습니다.", "", [], None, gr.update(choices=[], value=None)
 
-def run_indexing(rag_name, folder_img, folder_pdf, folder_doc,
-                 cfg_state, progress=gr.Progress()):
-    """선택한 폴더들을 스캔해 인덱싱 실행 (제너레이터로 로그 스트리밍)"""
-    if not rag_name:
-        yield "⚠ RAG를 먼저 선택하거나 생성하세요."
-        return
+    # 전체 zip
+    zip_path = run_dir.parent / f"{run_dir.name}.zip"
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for p in run_dir.rglob("*"):
+            if p.is_file():
+                zf.write(p, p.relative_to(run_dir.parent))
 
-    reg = load_registry()
-    if rag_name not in reg:
-        yield f"⚠ '{rag_name}' RAG를 찾을 수 없습니다."
-        return
+    first = results[0]
+    choices = [r["name"] for r in results]
+    run_pipeline._cache = {r["name"]: r for r in results}  # 미리보기 전환용
 
-    files = []
-    files += scan_folder(folder_img, "image")
-    files += scan_folder(folder_pdf, "pdf")
-    files += scan_folder(folder_doc, "doc")
-    files = sorted(set(files))
-
-    if not files:
-        yield "⚠ 추가할 파일이 없습니다. 폴더 경로를 확인하세요."
-        return
-
-    working_dir = reg[rag_name]["working_dir"]
-    cfg = cfg_state
-
-    log = [f"[{datetime.now():%H:%M:%S}] '{rag_name}' 인덱싱 시작 — {len(files)}개 파일"]
-    yield "\n".join(log)
-
-    try:
-        progress(0.05, desc="RAG 엔진 초기화...")
-        rag = build_rag_instance(working_dir, cfg)
-    except ImportError as e:
-        yield (f"❌ 패키지 미설치: {e}\n\n"
-               f"설치 가이드 탭을 참고하세요:\n"
-               f"  pip install \"raganything[all]\" \"docling[all]\"")
-        return
-    except Exception as e:
-        yield f"❌ 초기화 실패: {e}"
-        return
-
-    output_dir = str(Path(working_dir) / "parsed_output")
-
-    async def _process_all():
-        total = len(files)
-        # 이미지 직접 삽입을 위해 lightrag 인스턴스 보장
-        async def _ensure_lightrag():
-            if getattr(rag, "lightrag", None) is None:
-                # RAGAnything 내부 초기화 트리거
-                if hasattr(rag, "_ensure_lightrag_initialized"):
-                    await rag._ensure_lightrag_initialized()
-            return rag.lightrag
-
-        for i, fpath in enumerate(files, 1):
-            fname = Path(fpath).name
-            ext = Path(fpath).suffix.lower()
-            progress(0.1 + 0.85 * i / total, desc=f"{fname} ({i}/{total})")
-            log.append(f"[{datetime.now():%H:%M:%S}] [{i}/{total}] {fname}")
-            try:
-                if ext in IMAGE_EXTS:
-                    # 이미지: MinerU 우회, VLM으로 직접 설명 후 텍스트 삽입
-                    log.append(f"    🖼 VLM 이미지 분석 중...")
-                    desc = describe_image_via_vlm(fpath, cfg)
-                    lr = await _ensure_lightrag()
-                    await lr.ainsert(
-                        f"[이미지 파일: {fname}]\n경로: {fpath}\n\n{desc}"
-                    )
-                    log.append(f"    ✓ VLM 설명 완료 ({len(desc)}자)")
-                else:
-                    # PDF/문서: docling 파서로 처리
-                    await rag.process_document_complete(
-                        file_path=fpath, output_dir=output_dir, parse_method="auto"
-                    )
-            except Exception as e:
-                log.append(f"    ⚠ 건너뜀: {e}")
-        return total
-
-    try:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        total = loop.run_until_complete(_process_all())
-        loop.close()
-    except Exception as e:
-        log.append(f"❌ 인덱싱 중 오류: {e}")
-        yield "\n".join(log)
-        return
-
-    # 파일 수 갱신
-    reg = load_registry()
-    reg[rag_name]["file_count"] = reg[rag_name].get("file_count", 0) + total
-    save_registry(reg)
-
-    log.append(f"[{datetime.now():%H:%M:%S}] ✅ 완료 — {total}개 파일 인덱싱됨")
-    progress(1.0, desc="완료")
-    yield "\n".join(log)
-
-
-def normalize_history(history):
-    """history를 messages(dict) 형식으로 정규화 (Gradio 6.x 기준)."""
-    if not history:
-        return []
-    normalized = []
-    for item in history:
-        if isinstance(item, dict) and "role" in item and "content" in item:
-            normalized.append(item)
-        elif isinstance(item, (list, tuple)) and len(item) == 2:
-            # 튜플 형식이 섞여 들어온 경우 dict로 변환
-            normalized.append({"role": "user", "content": str(item[0] or "")})
-            normalized.append({"role": "assistant", "content": str(item[1] or "")})
-    return normalized
-
-
-def answer_question(question, rag_name, mode, history, cfg_state):
-    """Q&A — gradio 버전에 따라 messages(dict) 또는 tuples 형식으로 반환"""
-    # history 형식 정규화 (Gradio가 None / 혼합 형식으로 넘길 때 대응)
-    history = normalize_history(history)
-
-    if not question or not question.strip():
-        return history, ""
-    if not rag_name:
-        history = to_history_append(history, question, "⚠ 먼저 사용할 RAG를 선택하세요.")
-        return history, ""
-
-    reg = load_registry()
-    if rag_name not in reg:
-        history = to_history_append(history, question, f"⚠ '{rag_name}' RAG를 찾을 수 없습니다.")
-        return history, ""
-
-    working_dir = reg[rag_name]["working_dir"]
-    cfg = dict(cfg_state)
-    cfg["query_mode"] = mode
-
-    try:
-        rag = build_rag_instance(working_dir, cfg)
-
-        async def _q():
-            from lightrag import QueryParam
-            return await rag.aquery(question, param=QueryParam(mode=mode))
-
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        answer = loop.run_until_complete(_q())
-        loop.close()
-
-        if hasattr(answer, "get_response_text"):
-            answer = answer.get_response_text()
-        elif not isinstance(answer, str):
-            answer = str(answer)
-
-    except ImportError as e:
-        answer = f"❌ 패키지 미설치: {e}"
-    except Exception as e:
-        answer = f"❌ 오류: {e}"
-
-    history = to_history_append(history, question, answer)
-    return history, ""
-
-
-# ── 설정 콜백 ──
-def save_settings(url, llm, vlm, embed, embed_dim, num_ctx, parser, cfg_state):
-    cfg = dict(cfg_state)
-    cfg.update({
-        "ollama_base_url": url.strip(),
-        "llm_model": llm.strip(),
-        "vlm_model": vlm.strip(),
-        "embedding_model": embed.strip(),
-        "embedding_dim": int(embed_dim),
-        "num_ctx": int(num_ctx),
-        "parser": parser,
-    })
-    save_config(cfg)
-    return cfg, "✅ 설정이 저장되었습니다."
-
-
-def refresh_models(url):
-    models = fetch_ollama_models(url.strip())
-    if not models:
-        return (gr.update(), gr.update(), gr.update(),
-                "⚠ 모델을 가져오지 못했습니다. Ollama가 실행 중인지 확인하세요.")
     return (
-        gr.update(choices=models),
-        gr.update(choices=models),
-        gr.update(choices=models),
-        f"✅ {len(models)}개 모델을 가져왔습니다.",
+        "\n\n".join(logs),
+        first["md_text"],
+        first["images"],
+        str(zip_path),
+        gr.update(choices=choices, value=first["name"]),
     )
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-#  UI 구성 (Gradio 6.8.0)
-# ──────────────────────────────────────────────────────────────────────────────
-CUSTOM_CSS = """
-.gradio-container { max-width: 1200px !important; }
-#app-header {
-    background: linear-gradient(135deg, #1a1d23 0%, #2a2f3a 100%);
-    border-radius: 10px; padding: 18px 24px; margin-bottom: 12px;
-    border: 1px solid #3a3f4d;
-}
-#app-header h1 { color: #4a9eff; margin: 0; font-size: 22px; }
-#app-header p  { color: #8b9ab0; margin: 4px 0 0 0; font-size: 13px; }
-.status-box textarea { font-family: 'Consolas', monospace !important; font-size: 12px !important; }
-footer { display: none !important; }
-"""
-
-INSTALL_GUIDE_MD = """
-## ✅ 검증된 작동 환경 (사내 보안망 기준)
-
-이 조합에서 인덱싱·Q&A 정상 동작 확인됨:
-
-| 항목 | 값 | 비고 |
-|---|---|---|
-| Python | 3.10 | 3.11+도 가능 |
-| **lightrag-hku** | **1.4.9.8** | ⚠ 1.5.x는 Python 3.10에서 dataclass 버그 |
-| raganything | 1.3.1 | |
-| 임베딩 | nomic-embed-text (dim 768) | |
-| tiktoken 캐시 | `C:\\tiktoken_cache` | cl100k_base + o200k_base 파일 |
-| 프록시 | NO_PROXY=localhost | 앱이 자동 설정 |
-
-```bash
-# 핵심: lightrag 버전 고정
-pip install "lightrag-hku==1.4.9.8"
-```
-
-### 🔑 사내 보안망 3대 필수 준비물
-1. **tiktoken 캐시**: 인터넷 PC에서 cl100k_base, o200k_base 생성 → `C:\\tiktoken_cache`로 복사
-2. **Ollama 모델**: nomic-embed-text(임베딩) + LLM 모델을 미리 pull (또는 GGUF 수동 등록)
-3. **프록시 우회**: 앱이 NO_PROXY를 자동 설정하지만, 안 되면 수동으로 `set NO_PROXY=localhost,127.0.0.1`
-
----
-
-## 📦 패키지 설치 가이드
-
-### 1. 가상환경 (권장 — 의존성 충돌 방지)
-```bash
-python -m venv venv_rag
-# Windows
-venv_rag\\Scripts\\activate
-# Linux/macOS
-source venv_rag/bin/activate
-```
-
-### 2. 핵심 패키지
-```bash
-pip install gradio raganything "lightrag-hku==1.4.9.8"
-```
-
-### 3. 문서 파서 (택1)
-```bash
-# Docling — Office/HTML 강함, 설치 쉬움 (추천)
-pip install "docling[all]"
-
-# MinerU — PDF/OCR 강함, GPU 가속
-pip install magic-pdf[full]
-```
-
-### 4. Ollama 모델
-```bash
-# Ollama 설치: https://ollama.com
-
-# LLM (텍스트 생성) — 택1
-ollama pull qwen3:8b          # 검증됨
-ollama pull qwen2.5           # think 태그 없어 파싱 안정적
-
-# VLM (이미지 처리) — 이미지 RAG 시
-ollama pull qwen2.5vl:7b
-
-# 임베딩 (필수) — nomic 768차원
-ollama pull nomic-embed-text
-```
-
-#### Ollama 모델을 HuggingFace GGUF로 수동 등록 (보안망)
-```bash
-# 인터넷 PC에서 GGUF 다운로드 후 Modelfile 작성:
-#   FROM ./nomic-embed-text-v1.5.f16.gguf
-# 보안망 PC로 복사 후:
-ollama create nomic-embed-text -f Modelfile
-```
-
-### 5. tiktoken 오프라인 캐시 (보안망 필수)
-```python
-# 인터넷 되는 PC에서 실행:
-import os
-os.environ["TIKTOKEN_CACHE_DIR"] = r"C:\\tiktoken_cache"
-import tiktoken
-tiktoken.get_encoding("cl100k_base")
-tiktoken.get_encoding("o200k_base")
-# → C:\\tiktoken_cache 폴더를 보안망 PC의 같은 경로로 복사
-```
-
-### 6. 실행
-```bash
-python rag_studio_gradio.py
-# → http://127.0.0.1:7860
-```
-
-### ⚠ lightrag 1.5.x 사용 시 주의
-Python 3.10에서 1.5.x는 `nx-loopback` dataclass SyntaxError가 발생합니다.
-반드시 `lightrag-hku==1.4.9.8`로 고정하거나 Python 3.11+를 쓰세요.
-
-### 💡 하드웨어 권장
-| 작업 | GPU | RAM |
-|---|---|---|
-| 인덱싱 (구축) | VRAM 8GB+ | 16GB+ |
-| Q&A (이용) | CPU 가능* | 8GB+ |
-
-*Q&A 시 LLM은 Ollama 서버 URL로 원격 연결 권장
-"""
+def switch_preview(name):
+    cache = getattr(run_pipeline, "_cache", {})
+    r = cache.get(name)
+    if not r:
+        return "", []
+    return r["md_text"], r["images"]
 
 
-def build_app():
-    cfg = load_config()
+# ----------------------------------------------------------------------------
+# base64 유틸 탭 핸들러
+# ----------------------------------------------------------------------------
+def encode_file(f, notepad_style, wrap):
+    if not f:
+        return "", "", None
+    data = Path(f.name).read_bytes()
+    b64 = bytes_to_b64(data, notepad_style=bool(notepad_style), wrap=int(wrap))
+    style = f"Notepad++/MIME ({int(wrap)}자 줄바꿈)" if notepad_style else "표준 (한 줄)"
+    info = (f"{Path(f.name).name} · {len(data):,} bytes · "
+            f"sha256={sha256_bytes(data)[:16]}… · 스타일: {style} · base64 {len(b64):,}자")
+    # 전체 base64 를 .b64 파일로 저장(다른 도구 출력과 바이너리 diff 비교용)
+    out = WORK_ROOT / (Path(f.name).stem + (".np.b64" if notepad_style else ".b64"))
+    out.write_text(b64, encoding="ascii", newline="\n")
+    preview = b64 if len(b64) <= 4000 else b64[:4000] + f"\n… (총 {len(b64):,}자, 미리보기 절단)"
+    return info, preview, str(out)
 
-    with gr.Blocks(title="RAG Studio", css=CUSTOM_CSS) as demo:
-        # 상태 (설정값을 세션에 보관)
-        cfg_state = gr.State(cfg)
 
-        gr.HTML(
-            "<div id='app-header'>"
-            "<h1>◈ RAG Studio</h1>"
-            "<p>RAG-Anything · Ollama · 멀티모달 로컬 RAG 관리 도구</p>"
-            "</div>"
+def decode_b64(text, filename):
+    if not text.strip():
+        return "내용이 비었습니다.", None
+    try:
+        data = b64_to_bytes(text)
+    except Exception as e:
+        return f"디코드 실패: {e}", None
+    out = WORK_ROOT / (filename.strip() or "restored.bin")
+    out.write_bytes(data)
+    info = f"복원: {out.name} · {len(data):,} bytes · sha256={sha256_bytes(data)[:16]}…"
+    return info, str(out)
+
+
+# ----------------------------------------------------------------------------
+# UI
+# ----------------------------------------------------------------------------
+def build_ui():
+    with gr.Blocks(title="Docling Studio", theme=gr.themes.Soft()) as demo:
+        gr.Markdown(
+            "# 📄→🕸 Docling Studio\n"
+            "문서 → (선택)base64 → **DoclingDocument(JSON 정본) + Markdown(RAG 투입) + 그림 사이드카**\n\n"
+            "> graph-RAG 정본은 `*.docling.json` / `*.envelope.json`, 투입용은 `*.md` 입니다. "
+            "이미지는 인라인 base64가 아니라 REFERENCED 파일로 분리됩니다."
         )
 
-        with gr.Tabs():
-            # ════════════ TAB 1: RAG 관리 ════════════
-            with gr.Tab("📚 RAG 관리"):
-                with gr.Row():
-                    # 왼쪽: RAG 생성/선택
-                    with gr.Column(scale=1):
-                        gr.Markdown("### RAG 시스템")
-                        manage_dropdown = gr.Dropdown(
-                            label="RAG 선택",
-                            choices=get_rag_choices(),
-                            interactive=True,
+        if not DOCLING_AVAILABLE:
+            gr.Markdown(f"⚠️ **docling 미탑재** — `{DOCLING_IMPORT_ERROR}` · rag311 환경에서 실행하세요.")
+
+        with gr.Tab("문서 → DoclingDocument"):
+            with gr.Row():
+                with gr.Column(scale=1):
+                    files = gr.File(label="문서 업로드 (다중 가능)", file_count="multiple",
+                                    file_types=[".pdf", ".docx", ".pptx", ".xlsx", ".html",
+                                                ".doc", ".ppt", ".xls", ".png", ".jpg"])
+                    engine = gr.Radio(
+                        choices=[
+                            ("기본 (DocLayNet+TableFormer)", "standard"),
+                            ("granite-docling (Ollama VLM)", "granite"),
+                        ],
+                        value="standard",
+                        label="추출 엔진",
+                        info="표가 복잡하면 기본, 통합·간편함은 granite-docling",
+                    )
+                    with gr.Accordion("Ollama 설정 (granite 선택 시)", open=False):
+                        ollama_url = gr.Textbox(
+                            label="Ollama 주소", value="http://localhost:11434",
+                            info="/v1/chat/completions 는 자동 부착 · localhost 는 프록시 자동 우회",
                         )
-                        with gr.Accordion("➕ 새 RAG 만들기", open=True):
-                            new_name = gr.Textbox(
-                                label="이름",
-                                placeholder="예: 연구논문_2024, EDS_데이터셋")
-                            new_desc = gr.Textbox(
-                                label="설명 (선택)",
-                                placeholder="용도 / 내용 간단 설명")
-                            create_btn = gr.Button("만들기", variant="primary")
-                        delete_btn = gr.Button("선택한 RAG 삭제", variant="stop")
-                        manage_status = gr.Markdown("")
-
-                    # 오른쪽: 파일 추가 + 인덱싱
-                    with gr.Column(scale=2):
-                        gr.Markdown("### 파일 추가 (폴더 경로 입력 — 하위 폴더 재귀 탐색)")
-                        folder_img = gr.Textbox(
-                            label="🖼 이미지 폴더",
-                            placeholder="예: D:/data/images  (jpg, png, tiff, webp ...)")
-                        folder_pdf = gr.Textbox(
-                            label="📄 PDF 폴더",
-                            placeholder="예: D:/data/papers  (pdf)")
-                        folder_doc = gr.Textbox(
-                            label="📁 문서 폴더",
-                            placeholder="예: D:/data/docs  (ppt, pptx, csv, xlsx, txt, md, json)")
-
-                        with gr.Row():
-                            preview_btn = gr.Button("🔍 파일 미리보기")
-                            index_btn = gr.Button("⚡ 인덱싱 시작", variant="primary")
-
-                        preview_md = gr.Markdown("")
-                        files_state = gr.State([])
-
-                        index_log = gr.Textbox(
-                            label="처리 로그",
-                            lines=10,
-                            interactive=False,
-                            elem_classes="status-box",
+                        model_name = gr.Textbox(
+                            label="모델명", value="ibm/granite-docling",
+                            placeholder="ollama pull 한 태그 그대로",
                         )
+                    with gr.Accordion("docling 옵션", open=False):
+                        artifacts = gr.Textbox(
+                            label="모델 artifacts_path (기본 엔진·air-gapped 시)",
+                            placeholder="예: C:\\models\\docling  ·  granite 엔진엔 불필요",
+                        )
+                        use_gpu = gr.Checkbox(label="GPU(CUDA) 가속 (기본 엔진)", value=True)
+                        do_ocr = gr.Checkbox(label="OCR (스캔 PDF용, 느림·OCR모델 필요)", value=False)
+                        gen_images = gr.Checkbox(label="그림 추출(사이드카)", value=True)
+                        images_scale = gr.Slider(1.0, 4.0, value=2.0, step=0.5, label="그림 해상도 배율")
+                    with gr.Accordion("base64 레이어", open=False):
+                        roundtrip = gr.Checkbox(label="base64 round-trip 무결성 검증", value=True)
+                        embed = gr.Checkbox(
+                            label="envelope JSON에 원본 base64 보존(용량↑)", value=False)
+                    run_btn = gr.Button("변환 실행", variant="primary")
 
-                gr.Markdown("### 등록된 RAG 목록")
-                rag_table = gr.Dataframe(
-                    headers=["이름", "설명", "파일 수", "생성일", "저장 경로"],
-                    value=registry_to_table(),
-                    interactive=False,
-                    wrap=True,
-                )
+                with gr.Column(scale=2):
+                    log = gr.Textbox(label="로그", lines=10, max_lines=20)
+                    sel = gr.Dropdown(label="미리보기 선택", choices=[], interactive=True)
+                    with gr.Tab("Markdown"):
+                        md_view = gr.Code(label="Markdown (RAG 투입용)", language="markdown")
+                    with gr.Tab("그림 사이드카"):
+                        gallery = gr.Gallery(label="추출 이미지", columns=3, height=360)
+                    zip_out = gr.File(label="전체 결과 zip 다운로드")
 
-            # ════════════ TAB 2: Q&A ════════════
-            with gr.Tab("💬 Q&A"):
-                with gr.Row():
-                    qa_dropdown = gr.Dropdown(
-                        label="RAG 선택",
-                        choices=get_rag_choices(),
-                        scale=2,
-                        interactive=True,
-                    )
-                    qa_mode = gr.Dropdown(
-                        label="검색 모드",
-                        choices=["hybrid", "local", "global", "naive"],
-                        value="hybrid",
-                        scale=1,
-                        info="hybrid=그래프+벡터(권장)",
-                    )
-                    qa_refresh = gr.Button("↻ 목록 갱신", scale=1)
+            run_btn.click(
+                run_pipeline,
+                inputs=[files, engine, artifacts, do_ocr, gen_images, images_scale,
+                        use_gpu, ollama_url, model_name, roundtrip, embed],
+                outputs=[log, md_view, gallery, zip_out, sel],
+            )
+            sel.change(switch_preview, inputs=[sel], outputs=[md_view, gallery])
 
-                chatbot = make_chatbot(
-                    label="대화",
-                    height=440,
-                )
-                with gr.Row():
-                    question_box = gr.Textbox(
-                        label="질문",
-                        placeholder="질문을 입력하고 Enter (Shift+Enter 줄바꿈)",
-                        lines=2,
-                        scale=5,
-                    )
-                    ask_btn = gr.Button("전송 ▶", variant="primary", scale=1)
-                clear_btn = gr.Button("대화 초기화")
+        with gr.Tab("base64 유틸"):
+            gr.Markdown(
+                "파일 ↔ base64 라운드트립 (전송/무결성 테스트용)\n\n"
+                "> **Notepad++ 스타일**을 켜면 76자마다 줄바꿈(MIME 형식)을 넣어 "
+                "Notepad++ MIME Tools 등 다른 도구 출력과 문자열까지 맞춥니다. "
+                "줄바꿈은 표현 차이일 뿐 디코딩 결과는 표준과 동일합니다."
+            )
+            with gr.Row():
+                with gr.Column():
+                    enc_in = gr.File(label="파일 → base64")
+                    with gr.Row():
+                        np_style = gr.Checkbox(label="Notepad++ 스타일 (줄바꿈)", value=False)
+                        np_wrap = gr.Number(label="줄폭(자)", value=76, precision=0,
+                                            minimum=1, scale=0)
+                    enc_info = gr.Textbox(label="정보", interactive=False)
+                    enc_out = gr.Code(label="base64 (절단 미리보기)")
+                    enc_file = gr.File(label=".b64 파일 다운로드 (전체)")
+                    enc_in.change(encode_file, inputs=[enc_in, np_style, np_wrap],
+                                  outputs=[enc_info, enc_out, enc_file])
+                    np_style.change(encode_file, inputs=[enc_in, np_style, np_wrap],
+                                    outputs=[enc_info, enc_out, enc_file])
+                    np_wrap.change(encode_file, inputs=[enc_in, np_style, np_wrap],
+                                   outputs=[enc_info, enc_out, enc_file])
+                with gr.Column():
+                    dec_in = gr.Textbox(label="base64 → 파일", lines=8,
+                                        placeholder="base64 또는 data:...;base64, 붙여넣기 (줄바꿈 있어도 OK)")
+                    dec_name = gr.Textbox(label="복원 파일명", value="restored.pdf")
+                    dec_btn = gr.Button("복원")
+                    dec_info = gr.Textbox(label="결과", interactive=False)
+                    dec_file = gr.File(label="복원 파일")
+                    dec_btn.click(decode_b64, inputs=[dec_in, dec_name], outputs=[dec_info, dec_file])
 
-            # ════════════ TAB 3: 설정 ════════════
-            with gr.Tab("⚙ 설정"):
-                gr.Markdown("### Ollama 연결")
-                with gr.Row():
-                    set_url = gr.Textbox(
-                        label="Ollama URL",
-                        value=cfg["ollama_base_url"], scale=3)
-                    test_btn = gr.Button("연결 테스트", scale=1)
-                test_status = gr.Markdown("")
-
-                gr.Markdown("### 모델 선택")
-                fetch_btn = gr.Button("↻ Ollama 모델 목록 가져오기")
-                _models = fetch_ollama_models(cfg["ollama_base_url"])
-                with gr.Row():
-                    set_llm = gr.Dropdown(
-                        label="LLM (텍스트)", allow_custom_value=True,
-                        choices=_models or [cfg["llm_model"]], value=cfg["llm_model"])
-                    set_vlm = gr.Dropdown(
-                        label="VLM (이미지)", allow_custom_value=True,
-                        choices=_models or [cfg["vlm_model"]], value=cfg["vlm_model"])
-                    set_embed = gr.Dropdown(
-                        label="임베딩", allow_custom_value=True,
-                        choices=_models or [cfg["embedding_model"]], value=cfg["embedding_model"])
-
-                gr.Markdown("### 임베딩 / 파서 설정")
-                with gr.Row():
-                    set_dim = gr.Number(
-                        label="임베딩 차원", value=cfg["embedding_dim"], precision=0,
-                        info="nomic=768, mxbai=1024, bge-m3=1024")
-                    set_ctx = gr.Number(
-                        label="컨텍스트 크기 (num_ctx)", value=cfg["num_ctx"], precision=0,
-                        info="최소 32768 권장")
-                    set_parser = gr.Dropdown(
-                        label="문서 파서",
-                        choices=["docling", "mineru", "paddleocr"],
-                        value=cfg["parser"],
-                        info="보안망/오프라인은 docling 권장 (HF캐시 사용). mineru/paddleocr은 별도 모델 외부 다운로드 필요")
-
-                save_btn = gr.Button("설정 저장", variant="primary")
-                save_status = gr.Markdown("")
-
-            # ════════════ TAB 4: 설치 가이드 ════════════
-            with gr.Tab("📖 설치 가이드"):
-                gr.Markdown(INSTALL_GUIDE_MD)
-
-        # ──────────────── 이벤트 연결 ────────────────
-        # RAG 관리
-        create_btn.click(
-            create_rag,
-            inputs=[new_name, new_desc],
-            outputs=[manage_dropdown, manage_status, qa_dropdown, rag_table],
+        gr.Markdown(
+            "---\n"
+            "**기본 엔진 모델 준비**: 첫 실행 전 인터넷 PC에서 `docling-tools models download` 로 받아 "
+            "폴더째 옮긴 뒤 *artifacts_path* 에 지정. OCR을 켜면 OCR 엔진 모델도 별도 필요.\n\n"
+            "**granite-docling 준비**: 인터넷 PC에서 `ollama pull ibm/granite-docling` → "
+            "air-gapped 로 모델 옮긴 뒤 Ollama 가동. 엔진을 'granite-docling'으로 고르면 끝 "
+            "(artifacts_path·OCR 불필요). 표가 깨지면 기본 엔진으로 폴백하세요."
         )
-        delete_btn.click(
-            delete_rag,
-            inputs=[manage_dropdown],
-            outputs=[manage_dropdown, manage_status, qa_dropdown, rag_table],
-        )
-        preview_btn.click(
-            preview_folder,
-            inputs=[folder_img, folder_pdf, folder_doc],
-            outputs=[preview_md, files_state],
-        )
-        index_btn.click(
-            run_indexing,
-            inputs=[manage_dropdown, folder_img, folder_pdf, folder_doc, cfg_state],
-            outputs=[index_log],
-        ).then(
-            lambda: registry_to_table(), outputs=[rag_table]
-        )
-
-        # Q&A
-        ask_btn.click(
-            answer_question,
-            inputs=[question_box, qa_dropdown, qa_mode, chatbot, cfg_state],
-            outputs=[chatbot, question_box],
-        )
-        question_box.submit(
-            answer_question,
-            inputs=[question_box, qa_dropdown, qa_mode, chatbot, cfg_state],
-            outputs=[chatbot, question_box],
-        )
-        clear_btn.click(lambda: [], outputs=[chatbot])
-        qa_refresh.click(
-            lambda: gr.update(choices=get_rag_choices()),
-            outputs=[qa_dropdown],
-        )
-
-        # 설정
-        test_btn.click(lambda u: test_ollama(u), inputs=[set_url], outputs=[test_status])
-        fetch_btn.click(
-            refresh_models,
-            inputs=[set_url],
-            outputs=[set_llm, set_vlm, set_embed, save_status],
-        )
-        save_btn.click(
-            save_settings,
-            inputs=[set_url, set_llm, set_vlm, set_embed,
-                    set_dim, set_ctx, set_parser, cfg_state],
-            outputs=[cfg_state, save_status],
-        )
-
     return demo
 
 
 if __name__ == "__main__":
-    import argparse
-    parser = argparse.ArgumentParser(description="RAG Studio")
-    parser.add_argument("--host", default="127.0.0.1",
-                        help="서버 호스트 (기본: 127.0.0.1 / 내부망 공유: 0.0.0.0)")
-    parser.add_argument("--port", type=int, default=7860,
-                        help="서버 포트 (기본: 7860)")
-    parser.add_argument("--share", action="store_true",
-                        help="Gradio 공개 링크 생성 (외부망 필요)")
-    args = parser.parse_args()
-
-    ensure_dirs()
-    app = build_app()
-
-    print(f"\n✅ RAG Studio 시작")
-    print(f"   브라우저에서 열기 → http://{args.host}:{args.port}")
-    print(f"   종료: Ctrl+C\n")
-
-    app.launch(
-        server_name=args.host,
-        server_port=args.port,
-        show_error=True,
-        inbrowser=False,   # 사내 보안망에서 자동 브라우저 오픈 비활성화
-        share=args.share,
-    )
+    app = build_ui()
+    app.launch(server_name="0.0.0.0", server_port=7860, inbrowser=False)
